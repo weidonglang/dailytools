@@ -64,7 +64,7 @@ def detect_version(kind: str, executable: Path) -> str:
         return ""
     text = result.output
     patterns = {
-        "jdk": r'(?:version\s+")?(\d+(?:\.\d+){0,3})',
+        "jdk": r'(?:version\s+")?(\d+(?:\.\d+){0,3}(?:_\d+)?)',
         "python": r"Python\s+(\d+(?:\.\d+){1,2})",
         "node": r"v(\d+(?:\.\d+){1,2})",
     }
@@ -73,7 +73,8 @@ def detect_version(kind: str, executable: Path) -> str:
         return text.splitlines()[0] if text else "未知"
     version = match.group(1)
     if kind == "jdk" and version.startswith("1.8."):
-        return "8" + version[3:]
+        update = version.split("_", 1)
+        return f"8u{update[1]}" if len(update) == 2 else "8"
     return version
 
 
@@ -129,7 +130,7 @@ def _discover_jdks() -> list[tuple[Path, Path, str]]:
         if base.exists():
             for home in base.iterdir():
                 executable = home / "bin/java.exe"
-                if executable.exists():
+                if executable.exists() and (home / "bin/javac.exe").exists():
                     candidates.append((home, executable, "常用安装目录"))
     return candidates
 
@@ -216,12 +217,18 @@ def _detail_version(kind: str, detail: str) -> str:
     if not detail:
         return ""
     patterns = {
-        "jdk": r'(?:version\s+")?(\d+(?:\.\d+){0,3})',
+        "jdk": r'(?:version\s+")?(\d+(?:\.\d+){0,3}(?:_\d+)?)',
         "python": r"Python\s+(\d+(?:\.\d+){1,2})",
         "node": r"v(\d+(?:\.\d+){1,2})",
     }
     match = re.search(patterns[kind], detail, re.IGNORECASE)
-    return match.group(1) if match else ""
+    if not match:
+        return ""
+    version = match.group(1)
+    if kind == "jdk" and version.startswith("1.8."):
+        update = version.split("_", 1)
+        return f"8u{update[1]}" if len(update) == 2 else "8"
+    return version
 
 
 def _version_key(version: str) -> tuple[int, ...]:
