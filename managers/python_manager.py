@@ -78,7 +78,7 @@ class PythonManager(BaseRuntimeManager):
                 )
             except OSError as exc:
                 raise RuntimeError(f"复制现有 Python 失败：{exc}") from exc
-            return self._finalize_install(version, release, target, progress)
+            return self._finalize_install(version, release, target, progress, "copy")
         download_file(
             release["url"],
             installer,
@@ -110,9 +110,16 @@ class PythonManager(BaseRuntimeManager):
             raise RuntimeError(f"Python 安装器执行失败：{exc}") from exc
         if completed.returncode != 0:
             raise RuntimeError(f"Python 安装失败，退出码 {completed.returncode}")
-        return self._finalize_install(version, release, target, progress)
+        return self._finalize_install(version, release, target, progress, "installer")
 
-    def _finalize_install(self, version: str, release: dict[str, str], target: Path, progress: Progress) -> Path:
+    def _finalize_install(
+        self,
+        version: str,
+        release: dict[str, str],
+        target: Path,
+        progress: Progress,
+        install_mode: str,
+    ) -> Path:
         python_exe = target / "python.exe"
         progress(90, "正在验证 Python 和 pip")
         output = self.verify(python_exe, ["--version"])
@@ -121,11 +128,33 @@ class PythonManager(BaseRuntimeManager):
             version,
             target,
             python_exe,
-            {"detail": output.splitlines()[0] if output else release["full_version"]},
+            {
+                "detail": output.splitlines()[0] if output else release["full_version"],
+                "install_mode": install_mode,
+                "installer": str(self.config.paths.downloads / release["name"]),
+            },
         )
         self.switch(version)
         self.event_log.write(f"安装成功 Python {version}")
         return target
+
+    def uninstall(self, version: str) -> Path:
+        record = next((item for item in self.list_installed() if item.get("version") == version), None)
+        if not record:
+            raise RuntimeError(f"未找到 DevEnv 管理的 Python {version}")
+        if record.get("install_mode") == "installer":
+            installer = Path(record.get("installer", ""))
+            if installer.exists():
+                completed = subprocess.run(
+                    [str(installer), "/quiet", "/uninstall"],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(f"Python 卸载器执行失败，退出码 {completed.returncode}")
+        return super().uninstall(version)
 
     def create_venv(self, version: str, project_dir: Path) -> Path:
         record = next((item for item in self.list_installed() if item["version"] == version), None)

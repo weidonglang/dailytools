@@ -23,6 +23,7 @@ class RuntimeInstallation:
     source: str
     managed: bool = False
     current: bool = False
+    managed_id: str | None = None
 
 
 def discover_all(config: ConfigService) -> list[RuntimeInstallation]:
@@ -101,6 +102,7 @@ def _managed_installations(config: ConfigService) -> list[RuntimeInstallation]:
                     source="DevEnv 管理",
                     managed=True,
                     current=data.get("current", {}).get(kind) == record.get("version"),
+                    managed_id=record.get("version"),
                 )
             )
     return result
