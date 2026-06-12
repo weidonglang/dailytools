@@ -1,0 +1,5 @@
+customtkinter>=5.2.2,<6
+requests>=2.32,<3
+psutil>=6,<8
+packaging>=24,<27
+pyinstaller>=6.10,<7
