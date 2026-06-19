@@ -330,6 +330,59 @@ struct ProjectAnalysis {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ToolState {
+    name: String,
+    installed: bool,
+    version: String,
+    path: String,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitEnvironment {
+    git: ToolState,
+    git_bash_path: String,
+    user_name: String,
+    user_email: String,
+    ssh: ToolState,
+    ssh_key_exists: bool,
+    public_key_path: String,
+    public_key: String,
+    github_ssh_status: String,
+    github_https_status: String,
+    git_lfs: ToolState,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeEcosystem {
+    tools: Vec<ToolState>,
+    npm_prefix: String,
+    npm_registry: String,
+    pnpm_store_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PythonEcosystem {
+    tools: Vec<ToolState>,
+    pip_config: String,
+    pip_index_url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolchainReport {
+    tools: Vec<ToolDefinition>,
+    git: GitEnvironment,
+    node: NodeEcosystem,
+    python: PythonEcosystem,
+    generated_at: String,
+}
+
 #[derive(Debug, Clone)]
 struct UninstallEntry {
     display_name: String,
@@ -420,6 +473,20 @@ fn env_snapshot() -> EnvSnapshot {
 #[tauri::command]
 async fn configure_user_environment() -> Result<OperationResult, String> {
     run_blocking(configure_user_environment_blocking).await?
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct ToolDefinition {
+    id: &'static str,
+    name: &'static str,
+    category: &'static str,
+    exe_names: &'static [&'static str],
+    env_vars: &'static [&'static str],
+    managed_path_entries: &'static [&'static str],
+    supports_install: bool,
+    supports_switch: bool,
+    supports_mirror: bool,
 }
 
 fn configure_user_environment_blocking() -> Result<OperationResult, String> {
@@ -1412,15 +1479,64 @@ fn run_doctor_blocking() -> Result<DoctorReport, String> {
         );
     }
 
-    let git = command_probe("Git", "git", &["--version"]);
-    push_doctor_check(&mut checks, &mut score, git);
-    for (name, exe, args) in [
+    let git_path = resolve_tool(&paths, "git");
+    push_doctor_check(
+        &mut checks,
+        &mut score,
+        tool_state_doctor_check(probe_tool("Git", git_path.clone(), &["--version"]), true),
+    );
+    let git_name = command_value(git_path.clone(), &["config", "--global", "user.name"]);
+    let git_email = command_value(git_path, &["config", "--global", "user.email"]);
+    let git_identity_ok = !git_name.is_empty() && !git_email.is_empty();
+    push_doctor_check(
+        &mut checks,
+        &mut score,
+        DoctorCheck {
+            id: "git-identity".to_string(),
+            title: "Git 用户身份".to_string(),
+            category: "Git".to_string(),
+            status: if git_identity_ok { "正常" } else { "未配置" }.to_string(),
+            severity: if git_identity_ok { "info" } else { "notice" }.to_string(),
+            detail: if git_identity_ok { format!("{git_name} <{git_email}>") } else { "尚未同时配置 user.name 和 user.email".to_string() },
+            fix_action: Some("toolchains".to_string()),
+        },
+    );
+    let ssh_key_exists = dirs::home_dir()
+        .map(|home| home.join(".ssh/id_ed25519.pub").is_file() || home.join(".ssh/id_rsa.pub").is_file())
+        .unwrap_or(false);
+    push_doctor_check(
+        &mut checks,
+        &mut score,
+        DoctorCheck {
+            id: "git-ssh-key".to_string(),
+            title: "GitHub SSH Key".to_string(),
+            category: "Git".to_string(),
+            status: if ssh_key_exists { "已发现" } else { "未配置" }.to_string(),
+            severity: if ssh_key_exists { "info" } else { "notice" }.to_string(),
+            detail: if ssh_key_exists { "已发现 ed25519 或 RSA 公钥；报告不会包含私钥".to_string() } else { "没有发现常用 SSH 公钥，可在工具链页面安全生成".to_string() },
+            fix_action: Some("toolchains".to_string()),
+        },
+    );
+    for (name, executable, args) in [
         ("npm", "npm", vec!["--version"]),
         ("pnpm", "pnpm", vec!["--version"]),
-        ("yarn", "yarn", vec!["--version"]),
-        ("corepack", "corepack", vec!["--version"]),
-        ("uv", "uv", vec!["--version"]),
-        ("poetry", "poetry", vec!["--version"]),
+        ("Yarn", "yarn", vec!["--version"]),
+        ("Corepack", "corepack", vec!["--version"]),
+    ] {
+        let state = probe_tool(name, resolve_tool(&paths, executable), &args);
+        push_doctor_check(&mut checks, &mut score, tool_state_doctor_check(state, false));
+    }
+    let python_executable = resolve_tool(&paths, "python");
+    for (name, args) in [
+        ("pip", vec!["-m", "pip", "--version"]),
+        ("uv", vec!["-m", "uv", "--version"]),
+        ("Poetry", vec!["-m", "poetry", "--version"]),
+        ("virtualenv", vec!["-m", "virtualenv", "--version"]),
+    ] {
+        let state = probe_tool(name, python_executable.clone(), &args);
+        push_doctor_check(&mut checks, &mut score, tool_state_doctor_check(state, name == "pip"));
+    }
+    for (name, exe, args) in [
         ("Go", "go", vec!["version"]),
         ("Rust", "rustc", vec!["--version"]),
         (".NET", "dotnet", vec!["--version"]),
@@ -1701,6 +1817,228 @@ fn analyze_python_environment_blocking() -> PythonAnalysis {
         recommendations,
         pip_repair_command: "python -m ensurepip --upgrade; python -m pip install --upgrade pip".to_string(),
         alias_settings_command: "start ms-settings:appsfeatures-app".to_string(),
+    }
+}
+
+#[tauri::command]
+async fn inspect_toolchains() -> Result<ToolchainReport, String> {
+    run_blocking(inspect_toolchains_blocking).await?
+}
+
+fn inspect_toolchains_blocking() -> Result<ToolchainReport, String> {
+    let paths = load_paths()?;
+    let git = probe_tool("Git", resolve_tool(&paths, "git"), &["--version"]);
+    let ssh = probe_tool("OpenSSH", resolve_tool(&paths, "ssh"), &["-V"]);
+    let git_lfs = probe_tool("Git LFS", resolve_tool(&paths, "git-lfs"), &["version"]);
+    let git_bash_path = git_bash_from_git(&git.path).unwrap_or_default();
+    let user_name = command_value(resolve_tool(&paths, "git"), &["config", "--global", "user.name"]);
+    let user_email = command_value(resolve_tool(&paths, "git"), &["config", "--global", "user.email"]);
+    let ssh_dir = dirs::home_dir().unwrap_or_default().join(".ssh");
+    let public_key_path = ["id_ed25519.pub", "id_rsa.pub"]
+        .iter()
+        .map(|name| ssh_dir.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| ssh_dir.join("id_ed25519.pub"));
+    let public_key = fs::read_to_string(&public_key_path)
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    let github_ssh_status = github_ssh_status(resolve_tool(&paths, "ssh"));
+    let github_https_status = github_https_status();
+
+    let node_tools = [
+        ("Node.js", "node", vec!["--version"]),
+        ("npm", "npm", vec!["--version"]),
+        ("npx", "npx", vec!["--version"]),
+        ("pnpm", "pnpm", vec!["--version"]),
+        ("Yarn", "yarn", vec!["--version"]),
+        ("Corepack", "corepack", vec!["--version"]),
+    ]
+    .into_iter()
+    .map(|(name, executable, args)| probe_tool(name, resolve_tool(&paths, executable), &args))
+    .collect();
+    let npm = resolve_tool(&paths, "npm");
+    let pnpm = resolve_tool(&paths, "pnpm");
+    let npm_prefix = command_value(npm.clone(), &["config", "get", "prefix"]);
+    let npm_registry = command_value(npm, &["config", "get", "registry"]);
+    let pnpm_store_path = command_value(pnpm, &["store", "path"]);
+
+    let python = resolve_tool(&paths, "python");
+    let python_tools = [
+        ("pip", vec!["-m", "pip", "--version"]),
+        ("uv", vec!["-m", "uv", "--version"]),
+        ("Poetry", vec!["-m", "poetry", "--version"]),
+        ("virtualenv", vec!["-m", "virtualenv", "--version"]),
+    ]
+    .into_iter()
+    .map(|(name, args)| probe_tool(name, python.clone(), &args))
+    .collect();
+    let pip_config = command_value(python.clone(), &["-m", "pip", "config", "list"]);
+    let pip_index_url = pip_config_value(&pip_config, "global.index-url");
+
+    Ok(ToolchainReport {
+        tools: tool_registry(),
+        git: GitEnvironment {
+            git,
+            git_bash_path,
+            user_name,
+            user_email,
+            ssh,
+            ssh_key_exists: public_key_path.is_file(),
+            public_key_path: display_path(public_key_path),
+            public_key,
+            github_ssh_status,
+            github_https_status,
+            git_lfs,
+        },
+        node: NodeEcosystem {
+            tools: node_tools,
+            npm_prefix,
+            npm_registry,
+            pnpm_store_path,
+        },
+        python: PythonEcosystem {
+            tools: python_tools,
+            pip_config,
+            pip_index_url,
+        },
+        generated_at: current_timestamp(),
+    })
+}
+
+#[tauri::command]
+async fn run_toolchain_action(
+    app: tauri::AppHandle,
+    action: String,
+    value: Option<String>,
+    secondary: Option<String>,
+) -> Result<OperationResult, String> {
+    let task = toolchain_action_title(&action).to_string();
+    emit_task_progress(&app, &task, 5, "正在准备操作");
+    let worker_action = action.clone();
+    let result = run_blocking(move || run_toolchain_action_blocking(&worker_action, value, secondary)).await?;
+    emit_task_progress(
+        &app,
+        &task,
+        100,
+        if result.is_ok() { "操作完成" } else { "操作失败" },
+    );
+    result
+}
+
+fn run_toolchain_action_blocking(
+    action: &str,
+    value: Option<String>,
+    secondary: Option<String>,
+) -> Result<OperationResult, String> {
+    let paths = load_paths()?;
+    let required = |name: &str| {
+        resolve_tool(&paths, name).ok_or_else(|| format!("没有找到 {name}，请先安装对应工具并刷新诊断"))
+    };
+    let message = match action {
+        "git_identity" => {
+            let name = validate_setting(value.as_deref(), "Git 用户名")?;
+            let email = validate_setting(secondary.as_deref(), "Git 邮箱")?;
+            let git = required("git")?;
+            run_action_command(&paths, git.clone(), &["config", "--global", "user.name", &name])?;
+            run_action_command(&paths, git, &["config", "--global", "user.email", &email])?;
+            "已更新当前用户的 Git 用户名和邮箱".to_string()
+        }
+        "git_generate_ssh" => {
+            let email = validate_setting(value.as_deref(), "SSH Key 注释邮箱")?;
+            let target = dirs::home_dir()
+                .ok_or_else(|| "无法定位用户目录".to_string())?
+                .join(".ssh/id_ed25519");
+            if target.exists() || target.with_extension("pub").exists() {
+                return Err("已存在 id_ed25519 密钥，为避免覆盖已取消生成".to_string());
+            }
+            let parent = target.parent().ok_or_else(|| "SSH Key 路径无效".to_string())?;
+            fs::create_dir_all(parent).map_err(|err| format!("创建 .ssh 目录失败：{err}"))?;
+            let ssh_keygen = required("ssh-keygen")?;
+            run_action_command(
+                &paths,
+                ssh_keygen,
+                &["-t", "ed25519", "-C", &email, "-f", &display_path(&target), "-N", ""],
+            )?;
+            format!("已生成 SSH Key，公钥位于 {}", display_path(target.with_extension("pub")))
+        }
+        "git_test_ssh" => github_ssh_status(Some(required("ssh")?)),
+        "corepack_enable" => {
+            run_action_command(&paths, required("corepack")?, &["enable"])?;
+            "Corepack 已启用".to_string()
+        }
+        "npm_install_pnpm" => {
+            run_action_command(&paths, required("npm")?, &["install", "--global", "pnpm"])?;
+            "pnpm 已安装，请刷新工具链状态".to_string()
+        }
+        "npm_install_yarn" => {
+            run_action_command(&paths, required("npm")?, &["install", "--global", "yarn"])?;
+            "Yarn 已安装，请刷新工具链状态".to_string()
+        }
+        "npm_registry" => {
+            let registry = match value.as_deref() {
+                Some("official") => "https://registry.npmjs.org/",
+                Some("npmmirror") => "https://registry.npmmirror.com/",
+                _ => return Err("不支持的 npm 镜像源".to_string()),
+            };
+            run_action_command(&paths, required("npm")?, &["config", "set", "registry", registry])?;
+            format!("npm registry 已切换为 {registry}")
+        }
+        "npm_managed_prefix" => {
+            fs::create_dir_all(paths.npm_global()).map_err(|err| format!("创建 npm 全局目录失败：{err}"))?;
+            run_action_command(
+                &paths,
+                required("npm")?,
+                &["config", "set", "prefix", &display_path(paths.npm_global())],
+            )?;
+            "npm 全局目录已切换到 DevEnv Manager 受管目录".to_string()
+        }
+        "python_install_tool" => {
+            let package = match value.as_deref() {
+                Some("uv") => "uv",
+                Some("poetry") => "poetry",
+                Some("virtualenv") => "virtualenv",
+                _ => return Err("不支持的 Python 工具".to_string()),
+            };
+            run_action_command(
+                &paths,
+                required("python")?,
+                &["-m", "pip", "install", "--upgrade", package],
+            )?;
+            format!("{package} 已安装到当前 Python")
+        }
+        "pip_index" => {
+            let index = match value.as_deref() {
+                Some("official") => "https://pypi.org/simple",
+                Some("tsinghua") => "https://pypi.tuna.tsinghua.edu.cn/simple",
+                Some("aliyun") => "https://mirrors.aliyun.com/pypi/simple/",
+                Some("ustc") => "https://pypi.mirrors.ustc.edu.cn/simple/",
+                _ => return Err("不支持的 PyPI 镜像源".to_string()),
+            };
+            run_action_command(
+                &paths,
+                required("python")?,
+                &["-m", "pip", "config", "set", "global.index-url", index],
+            )?;
+            format!("pip 镜像源已切换为 {index}")
+        }
+        _ => return Err("不支持的工具链操作".to_string()),
+    };
+    Ok(OperationResult { success: true, message })
+}
+
+fn toolchain_action_title(action: &str) -> &'static str {
+    match action {
+        "git_identity" => "配置 Git 身份",
+        "git_generate_ssh" => "生成 SSH Key",
+        "git_test_ssh" => "测试 GitHub SSH",
+        "corepack_enable" => "启用 Corepack",
+        "npm_install_pnpm" => "安装 pnpm",
+        "npm_install_yarn" => "安装 Yarn",
+        "npm_registry" => "切换 npm 镜像",
+        "npm_managed_prefix" => "配置 npm 全局目录",
+        "python_install_tool" => "安装 Python 工具",
+        "pip_index" => "切换 pip 镜像",
+        _ => "工具链操作",
     }
 }
 
@@ -2071,6 +2409,8 @@ pub fn run() {
             run_doctor,
             export_doctor_report,
             analyze_python_environment,
+            inspect_toolchains,
+            run_toolchain_action,
             project_health,
             analyze_project,
             run_project_action,
@@ -3828,29 +4168,6 @@ fn push_doctor_check(checks: &mut Vec<DoctorCheck>, score: &mut i32, check: Doct
     checks.push(check);
 }
 
-fn command_probe(name: &str, executable: &str, args: &[&str]) -> DoctorCheck {
-    match detect_runtime(name, executable, args) {
-        Some(info) => DoctorCheck {
-            id: format!("tool-{}", slug(name)),
-            title: name.to_string(),
-            category: "工具".to_string(),
-            status: "正常".to_string(),
-            severity: "info".to_string(),
-            detail: format!("{} · {}", info.version, info.executable),
-            fix_action: Some("discover_runtimes".to_string()),
-        },
-        None => DoctorCheck {
-            id: format!("tool-{}", slug(name)),
-            title: name.to_string(),
-            category: "工具".to_string(),
-            status: "未安装".to_string(),
-            severity: "warning".to_string(),
-            detail: format!("没有找到 {executable}，相关项目可能无法构建或诊断"),
-            fix_action: Some("copy_fix_command".to_string()),
-        },
-    }
-}
-
 fn optional_command_probe(name: &str, executable: &str, args: &[&str]) -> DoctorCheck {
     match detect_runtime(name, executable, args) {
         Some(info) => DoctorCheck {
@@ -3872,6 +4189,200 @@ fn optional_command_probe(name: &str, executable: &str, args: &[&str]) -> Doctor
             fix_action: Some("copy_fix_command".to_string()),
         },
     }
+}
+
+fn tool_registry() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition { id: "jdk", name: "JDK", category: "runtime", exe_names: &["java", "javac"], env_vars: &["JAVA_HOME"], managed_path_entries: &[r"%DEVENV_HOME%\current\jdk\bin"], supports_install: true, supports_switch: true, supports_mirror: false },
+        ToolDefinition { id: "python", name: "Python", category: "runtime", exe_names: &["python", "pip"], env_vars: &[], managed_path_entries: &[r"%DEVENV_HOME%\current\python", r"%DEVENV_HOME%\current\python\Scripts"], supports_install: true, supports_switch: true, supports_mirror: true },
+        ToolDefinition { id: "node", name: "Node.js", category: "runtime", exe_names: &["node", "npm", "npx"], env_vars: &[], managed_path_entries: &[r"%DEVENV_HOME%\current\node"], supports_install: true, supports_switch: true, supports_mirror: true },
+        ToolDefinition { id: "maven", name: "Maven", category: "build", exe_names: &["mvn"], env_vars: &["MAVEN_HOME"], managed_path_entries: &[r"%DEVENV_HOME%\current\maven\bin"], supports_install: true, supports_switch: true, supports_mirror: true },
+        ToolDefinition { id: "gradle", name: "Gradle", category: "build", exe_names: &["gradle"], env_vars: &["GRADLE_HOME"], managed_path_entries: &[r"%DEVENV_HOME%\current\gradle\bin"], supports_install: true, supports_switch: true, supports_mirror: true },
+        ToolDefinition { id: "git", name: "Git", category: "scm", exe_names: &["git", "git-lfs", "ssh"], env_vars: &[], managed_path_entries: &[], supports_install: false, supports_switch: false, supports_mirror: false },
+        ToolDefinition { id: "go", name: "Go", category: "runtime", exe_names: &["go"], env_vars: &["GOROOT", "GOPATH", "GOPROXY"], managed_path_entries: &[], supports_install: false, supports_switch: false, supports_mirror: true },
+        ToolDefinition { id: "rust", name: "Rust", category: "runtime", exe_names: &["rustup", "rustc", "cargo"], env_vars: &["RUSTUP_HOME", "CARGO_HOME"], managed_path_entries: &[], supports_install: false, supports_switch: false, supports_mirror: true },
+        ToolDefinition { id: "dotnet", name: ".NET SDK", category: "runtime", exe_names: &["dotnet"], env_vars: &["DOTNET_ROOT"], managed_path_entries: &[], supports_install: false, supports_switch: false, supports_mirror: false },
+        ToolDefinition { id: "pnpm", name: "pnpm", category: "node-ecosystem", exe_names: &["pnpm"], env_vars: &["PNPM_HOME"], managed_path_entries: &[], supports_install: true, supports_switch: false, supports_mirror: true },
+        ToolDefinition { id: "yarn", name: "Yarn", category: "node-ecosystem", exe_names: &["yarn"], env_vars: &[], managed_path_entries: &[], supports_install: true, supports_switch: false, supports_mirror: true },
+        ToolDefinition { id: "python-tools", name: "Python 工具", category: "python-ecosystem", exe_names: &["uv", "poetry", "virtualenv"], env_vars: &[], managed_path_entries: &[], supports_install: true, supports_switch: false, supports_mirror: true },
+    ]
+}
+
+fn resolve_tool(paths: &AppPaths, executable: &str) -> Option<PathBuf> {
+    let managed = match executable {
+        "python" => Some(paths.current().join("python/python.exe")),
+        "node" => Some(paths.current().join("node/node.exe")),
+        "npm" => Some(paths.current().join("node/npm.cmd")),
+        "npx" => Some(paths.current().join("node/npx.cmd")),
+        "corepack" => Some(paths.current().join("node/corepack.cmd")),
+        "pnpm" => Some(paths.current().join("node/pnpm.cmd")),
+        "yarn" => Some(paths.current().join("node/yarn.cmd")),
+        _ => None,
+    };
+    managed
+        .filter(|path| path.is_file())
+        .or_else(|| find_all_on_path(executable).into_iter().next())
+        .or_else(|| find_on_user_path(paths, executable))
+}
+
+fn find_on_user_path(paths: &AppPaths, executable: &str) -> Option<PathBuf> {
+    let values = user_environment().ok()?;
+    let path_value = values.get("Path").or_else(|| values.get("PATH"))?;
+    let extensions = if cfg!(windows) {
+        vec![".exe", ".cmd", ".bat", ""]
+    } else {
+        vec![""]
+    };
+    for raw_dir in path_value.split(';') {
+        let dir = PathBuf::from(expand_environment_path(raw_dir, paths));
+        for extension in &extensions {
+            let candidate = dir.join(format!("{executable}{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn probe_tool(name: &str, executable: Option<PathBuf>, args: &[&str]) -> ToolState {
+    let Some(executable) = executable else {
+        return ToolState {
+            name: name.to_string(),
+            installed: false,
+            version: "未安装".to_string(),
+            path: String::new(),
+            detail: "没有在受管目录、当前 PATH 或用户 PATH 中找到".to_string(),
+        };
+    };
+    let output = hidden_command(&executable).args(args).output();
+    match output {
+        Ok(output) => {
+            let detail = command_text(&output.stdout, &output.stderr);
+            ToolState {
+                name: name.to_string(),
+                installed: output.status.success(),
+                version: detail.lines().next().unwrap_or("未返回版本").to_string(),
+                path: display_path(&executable),
+                detail: if output.status.success() {
+                    classify_source(&display_path(&executable))
+                } else {
+                    detail
+                },
+            }
+        }
+        Err(err) => ToolState {
+            name: name.to_string(),
+            installed: false,
+            version: "无法运行".to_string(),
+            path: display_path(executable),
+            detail: format!("执行失败：{err}"),
+        },
+    }
+}
+
+fn tool_state_doctor_check(state: ToolState, required: bool) -> DoctorCheck {
+    DoctorCheck {
+        id: format!("tool-{}", slug(&state.name)),
+        title: state.name,
+        category: "工具链".to_string(),
+        status: if state.installed { "正常" } else if required { "未安装" } else { "可选缺失" }.to_string(),
+        severity: if !state.installed && required { "warning" } else { "info" }.to_string(),
+        detail: if state.installed {
+            format!("{} · {}", state.version, state.path)
+        } else {
+            state.detail
+        },
+        fix_action: Some("toolchains".to_string()),
+    }
+}
+
+fn command_value(executable: Option<PathBuf>, args: &[&str]) -> String {
+    executable
+        .and_then(|path| hidden_command(path).args(args).output().ok())
+        .filter(|output| output.status.success())
+        .map(|output| command_text(&output.stdout, &output.stderr))
+        .unwrap_or_default()
+}
+
+fn run_action_command(paths: &AppPaths, executable: PathBuf, args: &[&str]) -> Result<String, String> {
+    let mut command = hidden_command(executable);
+    command.args(args);
+    apply_managed_environment(paths, &mut command);
+    let output = command.output().map_err(|err| format!("执行命令失败：{err}"))?;
+    let text = command_text(&output.stdout, &output.stderr);
+    if output.status.success() {
+        Ok(text)
+    } else if text.is_empty() {
+        Err(format!("命令执行失败，退出码 {}", output.status.code().unwrap_or(-1)))
+    } else {
+        Err(text)
+    }
+}
+
+fn validate_setting(value: Option<&str>, label: &str) -> Result<String, String> {
+    let value = value.unwrap_or_default().trim();
+    if value.is_empty() {
+        return Err(format!("{label}不能为空"));
+    }
+    if value.len() > 200 || value.chars().any(char::is_control) {
+        return Err(format!("{label}格式不正确"));
+    }
+    Ok(value.to_string())
+}
+
+fn git_bash_from_git(git_path: &str) -> Option<String> {
+    let git = PathBuf::from(git_path);
+    let root = git.parent()?.parent()?;
+    [root.join("bin/bash.exe"), root.join("git-bash.exe")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(display_path)
+}
+
+fn github_ssh_status(ssh: Option<PathBuf>) -> String {
+    let Some(ssh) = ssh else {
+        return "未安装 OpenSSH".to_string();
+    };
+    match hidden_command(ssh)
+        .args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "git@github.com"])
+        .output()
+    {
+        Ok(output) => {
+            let text = command_text(&output.stdout, &output.stderr);
+            if text.to_ascii_lowercase().contains("successfully authenticated") {
+                "认证成功".to_string()
+            } else if text.is_empty() {
+                format!("未通过，退出码 {}", output.status.code().unwrap_or(-1))
+            } else {
+                text.lines().next().unwrap_or("未通过").to_string()
+            }
+        }
+        Err(err) => format!("测试失败：{err}"),
+    }
+}
+
+fn github_https_status() -> String {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("DevEnvManager/2.0")
+        .timeout(std::time::Duration::from_secs(8))
+        .build();
+    match client.and_then(|client| client.get("https://github.com").send()) {
+        Ok(response) if response.status().is_success() => format!("正常（HTTP {}）", response.status().as_u16()),
+        Ok(response) => format!("异常（HTTP {}）", response.status().as_u16()),
+        Err(err) => format!("不可访问：{err}"),
+    }
+}
+
+fn pip_config_value(config: &str, key: &str) -> String {
+    config
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            (name.trim().trim_matches(['\'', '"']) == key)
+                .then(|| value.trim().trim_matches(['\'', '"']).to_string())
+        })
+        .unwrap_or_else(|| "未配置（使用环境或官方默认源）".to_string())
 }
 
 fn doctor_report_markdown(report: &DoctorReport) -> String {
@@ -4192,5 +4703,31 @@ mod tests {
     fn download_url_allowlist_rejects_unknown_hosts() {
         assert!(validate_download_url("https://nodejs.org/dist/index.json").is_ok());
         assert!(validate_download_url("https://example.com/file.zip").is_err());
+    }
+
+    #[test]
+    fn tool_registry_has_unique_ids_and_core_ecosystems() {
+        let tools = tool_registry();
+        let ids = tools.iter().map(|item| item.id).collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), tools.len());
+        assert!(ids.contains("git"));
+        assert!(ids.contains("pnpm"));
+        assert!(ids.contains("python-tools"));
+    }
+
+    #[test]
+    fn pip_config_parser_reads_quoted_index_url() {
+        let config = "global.index-url='https://pypi.tuna.tsinghua.edu.cn/simple'\n";
+        assert_eq!(
+            pip_config_value(config, "global.index-url"),
+            "https://pypi.tuna.tsinghua.edu.cn/simple"
+        );
+    }
+
+    #[test]
+    fn setting_validation_rejects_empty_and_control_characters() {
+        assert!(validate_setting(Some(""), "测试值").is_err());
+        assert!(validate_setting(Some("line\nbreak"), "测试值").is_err());
+        assert_eq!(validate_setting(Some("valid value"), "测试值").unwrap(), "valid value");
     }
 }

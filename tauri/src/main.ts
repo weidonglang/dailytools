@@ -9,7 +9,9 @@ import {
   FolderSearch,
   Gauge,
   Hammer,
+  KeyRound,
   Network,
+  PackageCheck,
   Play,
   RefreshCw,
   Route,
@@ -218,6 +220,42 @@ type ProjectAnalysis = {
   warnings: string[];
 };
 
+type ToolState = {
+  name: string;
+  installed: boolean;
+  version: string;
+  path: string;
+  detail: string;
+};
+
+type ToolchainReport = {
+  git: {
+    git: ToolState;
+    gitBashPath: string;
+    userName: string;
+    userEmail: string;
+    ssh: ToolState;
+    sshKeyExists: boolean;
+    publicKeyPath: string;
+    publicKey: string;
+    githubSshStatus: string;
+    githubHttpsStatus: string;
+    gitLfs: ToolState;
+  };
+  node: {
+    tools: ToolState[];
+    npmPrefix: string;
+    npmRegistry: string;
+    pnpmStorePath: string;
+  };
+  python: {
+    tools: ToolState[];
+    pipConfig: string;
+    pipIndexUrl: string;
+  };
+  generatedAt: string;
+};
+
 const app = document.querySelector<HTMLDivElement>("#app");
 
 if (!app) {
@@ -231,7 +269,7 @@ app.innerHTML = `
         <div class="brand-mark">${icon(Boxes)}</div>
         <div>
           <strong>DevEnv Manager</strong>
-          <span>Tauri Preview</span>
+          <span>Windows 开发环境管理</span>
         </div>
       </div>
       <nav class="nav">
@@ -241,6 +279,7 @@ app.innerHTML = `
         <button class="nav-item" data-view="runtimes">${icon(Terminal)}<span>运行时</span></button>
         <button class="nav-item" data-view="environment">${icon(Route)}<span>环境</span></button>
         <button class="nav-item" data-view="project">${icon(FolderSearch)}<span>项目</span></button>
+        <button class="nav-item" data-view="toolchains">${icon(PackageCheck)}<span>工具链</span></button>
         <button class="nav-item" data-view="toolbox">${icon(Hammer)}<span>工具箱</span></button>
       </nav>
     </aside>
@@ -248,7 +287,7 @@ app.innerHTML = `
       <header class="topbar">
         <div>
           <h1>DevEnv Manager</h1>
-          <p id="subtitle">轻量 Tauri/Rust 重构预览版</p>
+          <p id="subtitle">诊断、修复、切换和启动项目</p>
         </div>
         <button id="refresh-all" class="primary">${icon(RefreshCw)}<span>刷新</span></button>
       </header>
@@ -292,6 +331,7 @@ app.innerHTML = `
               <li><span class="dot done"></span> PATH 修复与恢复</li>
               <li><span class="dot done"></span> Python / Node / Maven / Gradle 安装和验证</li>
               <li><span class="dot done"></span> 环境医生、Python 冲突分析、项目启动向导</li>
+              <li><span class="dot done"></span> Git / Node / Python 开发工具链</li>
             </ul>
           </section>
         </div>
@@ -466,6 +506,69 @@ app.innerHTML = `
         </div>
       </section>
 
+      <section id="view-toolchains" class="view">
+        <section class="panel">
+          <div class="panel-head">
+            <div class="panel-title">${icon(PackageCheck)}<h2>开发工具链</h2></div>
+            <button id="inspect-toolchains" class="primary">${icon(RefreshCw)}<span>全面检查</span></button>
+          </div>
+        </section>
+
+        <section class="panel toolchain-section">
+          <div class="panel-title">${icon(KeyRound)}<h2>Git / GitHub</h2></div>
+          <div id="git-toolchain" class="toolchain-content"><div class="empty">点击“全面检查”读取 Git 环境</div></div>
+          <div class="form-row toolchain-form">
+            <input id="git-user-name" placeholder="Git 用户名" />
+            <input id="git-user-email" type="email" placeholder="Git 邮箱" />
+            <button id="save-git-identity">${icon(Shield)}<span>保存身份</span></button>
+          </div>
+          <div class="toolbar">
+            <button id="generate-ssh-key">${icon(KeyRound)}<span>生成 ed25519 Key</span></button>
+            <button id="test-github-ssh">${icon(Activity)}<span>测试 GitHub SSH</span></button>
+            <button id="copy-public-key">${icon(Clipboard)}<span>复制公钥</span></button>
+          </div>
+        </section>
+
+        <div class="grid two">
+          <section class="panel toolchain-section">
+            <div class="panel-title">${icon(PackageCheck)}<h2>Node.js 生态</h2></div>
+            <div id="node-toolchain" class="toolchain-content"><div class="empty">尚未检查 Node.js 工具链</div></div>
+            <div class="toolbar">
+              <button data-toolchain-action="corepack_enable">启用 Corepack</button>
+              <button data-toolchain-action="npm_install_pnpm">安装 pnpm</button>
+              <button data-toolchain-action="npm_install_yarn">安装 Yarn</button>
+              <button data-toolchain-action="npm_managed_prefix">使用受管全局目录</button>
+            </div>
+            <div class="form-row">
+              <select id="npm-registry">
+                <option value="official">npm 官方源</option>
+                <option value="npmmirror">npmmirror</option>
+              </select>
+              <button id="set-npm-registry">切换 npm 源</button>
+            </div>
+          </section>
+
+          <section class="panel toolchain-section">
+            <div class="panel-title">${icon(PackageCheck)}<h2>Python 生态</h2></div>
+            <div id="python-toolchain" class="toolchain-content"><div class="empty">尚未检查 Python 工具链</div></div>
+            <div class="toolbar">
+              <button data-python-tool="uv">安装 uv</button>
+              <button data-python-tool="poetry">安装 Poetry</button>
+              <button data-python-tool="virtualenv">安装 virtualenv</button>
+            </div>
+            <div class="form-row">
+              <select id="pip-index">
+                <option value="official">PyPI 官方源</option>
+                <option value="tsinghua">清华源</option>
+                <option value="aliyun">阿里云源</option>
+                <option value="ustc">中科大源</option>
+              </select>
+              <button id="set-pip-index">切换 pip 源</button>
+            </div>
+          </section>
+        </div>
+      </section>
+
       <section id="view-toolbox" class="view">
         <div class="grid two">
           <section class="panel">
@@ -535,6 +638,7 @@ const state = {
   doctor: null as DoctorReport | null,
   python: null as PythonAnalysis | null,
   project: null as ProjectAnalysis | null,
+  toolchains: null as ToolchainReport | null,
 };
 
 const portState = {
@@ -904,6 +1008,7 @@ function doctorActionLabel(action: string) {
     network: "网络诊断",
     ports: "查看端口",
     cache: "查看缓存",
+    toolchains: "查看工具链",
     copy_fix_command: "复制建议",
   };
   return labels[action] || "处理";
@@ -972,6 +1077,79 @@ function renderPythonAnalysis() {
     </div>
     <ul>${analysis.recommendations.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
   `;
+}
+
+function renderToolStates(items: ToolState[]) {
+  return items
+    .map(
+      (item) => `
+        <article class="runtime tool-state ${item.installed ? "ok" : "warn"}">
+          <div><strong>${escapeHtml(item.name)}</strong><span>${item.installed ? "可用" : "缺失"}</span></div>
+          <small>${escapeHtml(item.version)}${item.path ? ` · ${escapeHtml(item.path)}` : ""}</small>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderToolchains() {
+  const git = document.querySelector<HTMLElement>("#git-toolchain");
+  const node = document.querySelector<HTMLElement>("#node-toolchain");
+  const python = document.querySelector<HTMLElement>("#python-toolchain");
+  const report = state.toolchains;
+  if (!git || !node || !python || !report) return;
+
+  git.innerHTML = `
+    <div class="tool-state-grid">${renderToolStates([report.git.git, report.git.ssh, report.git.gitLfs])}</div>
+    <div class="kv-list toolchain-kv">
+      <div><span>Git Bash</span><strong>${escapeHtml(report.git.gitBashPath || "未发现")}</strong></div>
+      <div><span>GitHub HTTPS</span><strong>${escapeHtml(report.git.githubHttpsStatus)}</strong></div>
+      <div><span>GitHub SSH</span><strong>${escapeHtml(report.git.githubSshStatus)}</strong></div>
+      <div><span>SSH 公钥</span><strong>${escapeHtml(report.git.sshKeyExists ? report.git.publicKeyPath : "未生成")}</strong></div>
+    </div>
+  `;
+  const nameInput = document.querySelector<HTMLInputElement>("#git-user-name");
+  const emailInput = document.querySelector<HTMLInputElement>("#git-user-email");
+  if (nameInput && !nameInput.value) nameInput.value = report.git.userName;
+  if (emailInput && !emailInput.value) emailInput.value = report.git.userEmail;
+
+  node.innerHTML = `
+    <div class="tool-state-grid">${renderToolStates(report.node.tools)}</div>
+    <div class="kv-list toolchain-kv">
+      <div><span>npm registry</span><strong>${escapeHtml(report.node.npmRegistry || "未读取")}</strong></div>
+      <div><span>npm 全局目录</span><strong>${escapeHtml(report.node.npmPrefix || "未读取")}</strong></div>
+      <div><span>pnpm store</span><strong>${escapeHtml(report.node.pnpmStorePath || "未读取")}</strong></div>
+    </div>
+  `;
+  python.innerHTML = `
+    <div class="tool-state-grid">${renderToolStates(report.python.tools)}</div>
+    <div class="kv-list toolchain-kv">
+      <div><span>pip index-url</span><strong>${escapeHtml(report.python.pipIndexUrl)}</strong></div>
+    </div>
+    <pre class="command-output compact-output">${escapeHtml(report.python.pipConfig || "pip 没有返回额外配置")}</pre>
+  `;
+}
+
+async function inspectToolchains(message = "正在检查开发工具链") {
+  showToast(message);
+  try {
+    state.toolchains = await invoke<ToolchainReport>("inspect_toolchains");
+    renderToolchains();
+    showToast("工具链检查完成");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function runToolchainAction(action: string, value: string | null = null, secondary: string | null = null) {
+  showToast("正在执行工具链操作");
+  try {
+    const result = await invoke<OperationResult>("run_toolchain_action", { action, value, secondary });
+    showToast(result.message);
+    await inspectToolchains("正在验证操作结果");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
 }
 
 function filteredPorts(records: PortRecord[]) {
@@ -1253,6 +1431,11 @@ async function runDoctorAction(action: string) {
     showToast("缓存列表已刷新");
     return;
   }
+  if (action === "toolchains") {
+    activateView("toolchains");
+    await inspectToolchains();
+    return;
+  }
   if (action === "copy_fix_command") {
     await copyText("devenv doctor");
     return;
@@ -1441,6 +1624,42 @@ document.querySelector("#analyze-python")?.addEventListener("click", async () =>
     showToast(error instanceof Error ? error.message : String(error), true);
   }
 });
+document.querySelector("#inspect-toolchains")?.addEventListener("click", () => void inspectToolchains());
+document.querySelector("#save-git-identity")?.addEventListener("click", () => {
+  const name = document.querySelector<HTMLInputElement>("#git-user-name")?.value.trim() || "";
+  const email = document.querySelector<HTMLInputElement>("#git-user-email")?.value.trim() || "";
+  if (!name || !email) {
+    showToast("请填写 Git 用户名和邮箱", true);
+    return;
+  }
+  void runToolchainAction("git_identity", name, email);
+});
+document.querySelector("#generate-ssh-key")?.addEventListener("click", () => {
+  const email = document.querySelector<HTMLInputElement>("#git-user-email")?.value.trim() || "";
+  if (!email) {
+    showToast("请先填写用于 SSH Key 注释的邮箱", true);
+    return;
+  }
+  if (!window.confirm("将在当前用户 .ssh 目录生成 id_ed25519。已有同名密钥时会自动拒绝覆盖，确定继续吗？")) return;
+  void runToolchainAction("git_generate_ssh", email);
+});
+document.querySelector("#test-github-ssh")?.addEventListener("click", () => void runToolchainAction("git_test_ssh"));
+document.querySelector("#copy-public-key")?.addEventListener("click", () => {
+  const publicKey = state.toolchains?.git.publicKey || "";
+  if (!publicKey) {
+    showToast("当前没有可复制的 SSH 公钥", true);
+    return;
+  }
+  void copyText(publicKey);
+});
+document.querySelector("#set-npm-registry")?.addEventListener("click", () => {
+  const value = document.querySelector<HTMLSelectElement>("#npm-registry")?.value || "official";
+  void runToolchainAction("npm_registry", value);
+});
+document.querySelector("#set-pip-index")?.addEventListener("click", () => {
+  const value = document.querySelector<HTMLSelectElement>("#pip-index")?.value || "official";
+  void runToolchainAction("pip_index", value);
+});
 document.querySelector("#configure-env")?.addEventListener("click", () => {
   void runOperation(() => invoke<OperationResult>("configure_user_environment"), "正在配置用户环境变量");
 });
@@ -1556,7 +1775,9 @@ document.querySelectorAll<HTMLButtonElement>(".sort-head").forEach((button) => {
 });
 
 document.addEventListener("click", (event) => {
-  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-action]");
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>(
+    "button[data-action], button[data-toolchain-action], button[data-python-tool]",
+  );
   if (!button) return;
   const action = button.dataset.action;
   if (action === "doctor-fix") {
@@ -1565,6 +1786,14 @@ document.addEventListener("click", (event) => {
   }
   if (action === "copy-text") {
     void copyText(button.dataset.copy || "");
+  }
+  const toolchainAction = button.dataset.toolchainAction;
+  if (toolchainAction) {
+    void runToolchainAction(toolchainAction);
+  }
+  const pythonTool = button.dataset.pythonTool;
+  if (pythonTool) {
+    void runToolchainAction("python_install_tool", pythonTool);
   }
   if (action === "project-run") {
     const input = document.querySelector<HTMLInputElement>("#project-path");
