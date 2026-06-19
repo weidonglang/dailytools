@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# PyInstaller and local builds
+build/
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# Tauri / Node / Rust
+tauri/node_modules/
+tauri/dist/
+tauri/src-tauri/target/
+tauri/src-tauri/gen/
+
+# Logs and temp files
+*.log
+*.tmp
+
