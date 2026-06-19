@@ -11,6 +11,7 @@ import {
   Play,
   RefreshCw,
   Route,
+  Search,
   Shield,
   Terminal,
   Trash2,
@@ -91,6 +92,9 @@ type PortRecord = {
   risk: string;
 };
 
+type PortSortKey = "protocol" | "localAddress" | "localPort" | "state" | "pid" | "processName" | "risk";
+type SortDirection = "asc" | "desc";
+
 type ProjectHealth = {
   root: string;
   projectTypes: string[];
@@ -127,6 +131,12 @@ type CommandRunResult = {
   returnCode: number;
   output: string;
   elapsedMs: number;
+};
+
+type EnvHealthCheck = {
+  name: string;
+  status: string;
+  detail: string;
 };
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -216,10 +226,40 @@ app.innerHTML = `
             <div class="panel-title">${icon(Network)}<h2>端口管理</h2></div>
             <button id="scan-ports">${icon(RefreshCw)}<span>扫描</span></button>
           </div>
+          <div class="port-tools">
+            <div class="search-box">${icon(Search)}<input id="port-search" placeholder="输入 8080、java、web、mysql、pid、进程名..." /></div>
+            <div id="port-quick-filters" class="chip-row port-filter-row">
+              <button class="filter-chip active" data-port-filter="all">全部</button>
+              <button class="filter-chip" data-port-filter="spring">Spring</button>
+              <button class="filter-chip" data-port-filter="tomcat">Tomcat</button>
+              <button class="filter-chip" data-port-filter="frontend">前端</button>
+              <button class="filter-chip" data-port-filter="database">数据库</button>
+              <button class="filter-chip" data-port-filter="sensitive">敏感</button>
+            </div>
+          </div>
           <div class="table-wrap">
             <table>
+              <colgroup>
+                <col class="col-protocol" />
+                <col class="col-address" />
+                <col class="col-port" />
+                <col class="col-state" />
+                <col class="col-pid" />
+                <col class="col-process" />
+                <col class="col-risk" />
+                <col class="col-action" />
+              </colgroup>
               <thead>
-                <tr><th>协议</th><th>本地地址</th><th>端口</th><th>状态</th><th>PID</th><th>进程</th><th>风险</th><th>操作</th></tr>
+                <tr>
+                  <th><button class="sort-head" data-sort="protocol">协议</button></th>
+                  <th><button class="sort-head" data-sort="localAddress">本地地址</button></th>
+                  <th><button class="sort-head" data-sort="localPort">端口</button></th>
+                  <th><button class="sort-head" data-sort="state">状态</button></th>
+                  <th><button class="sort-head" data-sort="pid">PID</button></th>
+                  <th><button class="sort-head" data-sort="processName">进程</button></th>
+                  <th><button class="sort-head" data-sort="risk">风险</button></th>
+                  <th>操作</th>
+                </tr>
               </thead>
               <tbody id="ports-body"></tbody>
             </table>
@@ -294,9 +334,12 @@ app.innerHTML = `
             <div class="panel-title">${icon(Route)}<h2>环境变量</h2></div>
             <div class="toolbar">
               <button id="configure-env">${icon(Shield)}<span>配置</span></button>
+              <button id="check-env-health">${icon(Activity)}<span>检查</span></button>
+              <button id="cleanup-path">${icon(Trash2)}<span>清理失效 PATH</span></button>
               <button id="restore-env">${icon(RefreshCw)}<span>恢复</span></button>
             </div>
             <div id="env-list" class="kv-list"></div>
+            <div id="env-health" class="runtime-list health-list"></div>
           </section>
           <section class="panel">
             <div class="panel-title">${icon(Shield)}<h2>PATH 检查</h2></div>
@@ -334,6 +377,13 @@ app.innerHTML = `
           </div>
           <pre id="command-output" class="command-output"></pre>
         </section>
+        <section class="panel runtime-manager danger-panel">
+          <div class="panel-title">${icon(Trash2)}<h2>卸载本程序</h2></div>
+          <div class="toolbar">
+            <button id="self-uninstall" class="danger-button">${icon(Trash2)}<span>启动卸载程序</span></button>
+          </div>
+          <div class="small-note">会打开 Windows 卸载器并关闭当前程序。</div>
+        </section>
       </section>
 
       <section id="view-project" class="view">
@@ -361,6 +411,38 @@ const state = {
   ports: [] as PortRecord[],
   network: null as NetworkDiagnostics | null,
   cache: [] as CacheEntry[],
+  health: [] as EnvHealthCheck[],
+};
+
+const portState = {
+  sortKey: "localPort" as PortSortKey,
+  sortDirection: "asc" as SortDirection,
+  query: "",
+  quickFilter: "all",
+};
+
+const commonPorts: Array<{ key: string; label: string; ports: number[]; keywords: string[] }> = [
+  { key: "spring", label: "Spring", ports: [8080, 8081, 8082, 8888, 8761], keywords: ["java", "spring"] },
+  { key: "tomcat", label: "Tomcat", ports: [8080, 8005, 8009, 8443], keywords: ["tomcat", "java"] },
+  { key: "frontend", label: "前端", ports: [3000, 4173, 5173, 5174, 8080], keywords: ["node", "vite", "npm"] },
+  { key: "database", label: "数据库", ports: [3306, 5432, 6379, 27017, 9200], keywords: ["mysql", "postgres", "redis", "mongo", "elastic"] },
+];
+
+const portAliases: Record<string, string[]> = {
+  boot: ["spring"],
+  springboot: ["spring"],
+  java: ["spring", "tomcat"],
+  web: ["spring", "tomcat", "frontend"],
+  vite: ["frontend"],
+  vue: ["frontend"],
+  react: ["frontend"],
+  mysql: ["3306", "database"],
+  redis: ["6379", "database"],
+  postgres: ["5432", "database"],
+  postgresql: ["5432", "database"],
+  mongo: ["27017", "database"],
+  elastic: ["9200", "database"],
+  es: ["9200", "database"],
 };
 
 function icon(node: IconNode) {
@@ -432,7 +514,12 @@ function renderEnv() {
   const warnings = document.querySelector<HTMLElement>("#path-warnings");
   if (!warnings) return;
   warnings.innerHTML = state.env.pathWarnings.length
-    ? state.env.pathWarnings.map((item) => `<div class="warning">${escapeHtml(item)}</div>`).join("")
+    ? state.env.pathWarnings
+        .map((item) => {
+          const kind = item.startsWith("托管 PATH") ? "pending" : item.startsWith("重复 PATH") ? "duplicate" : "invalid";
+          return `<div class="warning ${kind}">${escapeHtml(item)}</div>`;
+        })
+        .join("")
     : `<div class="empty">当前进程 PATH 没有发现重复或失效条目</div>`;
 }
 
@@ -447,6 +534,7 @@ function renderRuntimes() {
             <article class="runtime">
               <div><strong>${escapeHtml(runtime.kind)}</strong><span>${escapeHtml(runtime.version)}</span></div>
               <small>${escapeHtml(runtime.source)} · ${escapeHtml(runtime.executable)}</small>
+              ${canUninstallExternal(runtime) ? `<div class="row-actions"><button data-action="uninstall-external-runtime" data-kind="${escapeHtml(runtime.kind)}" data-executable="${escapeHtml(runtime.executable)}">${icon(Trash2)}<span>系统卸载</span></button></div>` : ""}
             </article>
           `,
         )
@@ -474,8 +562,8 @@ function renderManagedJdks() {
               </div>
               <small>${escapeHtml(jdk.path)}</small>
               <div class="row-actions">
-                <button data-action="switch-jdk" data-version="${escapeHtml(jdk.version)}">${icon(RefreshCw)}<span>切换</span></button>
-                <button data-action="uninstall-jdk" data-version="${escapeHtml(jdk.version)}">${icon(Trash2)}<span>卸载</span></button>
+                <button data-action="switch-jdk" data-version="${escapeHtml(jdk.version)}" data-path="${escapeHtml(jdk.path)}">${icon(RefreshCw)}<span>切换</span></button>
+                <button data-action="uninstall-jdk" data-version="${escapeHtml(jdk.version)}" data-path="${escapeHtml(jdk.path)}">${icon(Trash2)}<span>卸载</span></button>
               </div>
             </article>
           `,
@@ -500,8 +588,8 @@ function renderManagedNodes() {
               </div>
               <small>${escapeHtml(node.path)}</small>
               <div class="row-actions">
-                <button data-action="switch-node" data-version="${escapeHtml(node.version)}">${icon(RefreshCw)}<span>切换</span></button>
-                <button data-action="uninstall-node" data-version="${escapeHtml(node.version)}">${icon(Trash2)}<span>卸载</span></button>
+                <button data-action="switch-node" data-version="${escapeHtml(node.version)}" data-path="${escapeHtml(node.path)}">${icon(RefreshCw)}<span>切换</span></button>
+                <button data-action="uninstall-node" data-version="${escapeHtml(node.version)}" data-path="${escapeHtml(node.path)}">${icon(Trash2)}<span>卸载</span></button>
               </div>
             </article>
           `,
@@ -526,8 +614,8 @@ function renderManagedPythons() {
               </div>
               <small>${escapeHtml(python.path)}</small>
               <div class="row-actions">
-                <button data-action="switch-python" data-version="${escapeHtml(python.version)}">${icon(RefreshCw)}<span>切换</span></button>
-                <button data-action="uninstall-python" data-version="${escapeHtml(python.version)}">${icon(Trash2)}<span>卸载</span></button>
+                <button data-action="switch-python" data-version="${escapeHtml(python.version)}" data-path="${escapeHtml(python.path)}">${icon(RefreshCw)}<span>切换</span></button>
+                <button data-action="uninstall-python" data-version="${escapeHtml(python.version)}" data-path="${escapeHtml(python.path)}">${icon(Trash2)}<span>卸载</span></button>
               </div>
             </article>
           `,
@@ -555,8 +643,8 @@ function renderManagedBuildTools() {
               </div>
               <small>${escapeHtml(item.path)}</small>
               <div class="row-actions">
-                <button data-action="switch-build-tool" data-kind="${item.kind}" data-version="${escapeHtml(item.version)}">${icon(RefreshCw)}<span>切换</span></button>
-                <button data-action="uninstall-build-tool" data-kind="${item.kind}" data-version="${escapeHtml(item.version)}">${icon(Trash2)}<span>卸载</span></button>
+                <button data-action="switch-build-tool" data-kind="${item.kind}" data-version="${escapeHtml(item.version)}" data-path="${escapeHtml(item.path)}">${icon(RefreshCw)}<span>切换</span></button>
+                <button data-action="uninstall-build-tool" data-kind="${item.kind}" data-version="${escapeHtml(item.version)}" data-path="${escapeHtml(item.path)}">${icon(Trash2)}<span>卸载</span></button>
               </div>
             </article>
           `,
@@ -566,26 +654,122 @@ function renderManagedBuildTools() {
 }
 
 function renderPorts() {
-  setText("metric-ports", state.ports.length);
+  const visible = sortedPorts(filteredPorts(state.ports));
+  setText("metric-ports", visible.length);
   const body = document.querySelector<HTMLElement>("#ports-body");
   if (!body) return;
-  body.innerHTML = state.ports
+  body.innerHTML = visible
     .slice(0, 250)
     .map(
-      (record) => `
+      (record) => {
+        const hint = portHint(record);
+        return `
         <tr>
           <td>${escapeHtml(record.protocol)}</td>
           <td>${escapeHtml(record.localAddress)}</td>
-          <td>${record.localPort}</td>
+          <td><strong>${record.localPort}</strong>${hint ? `<span class="port-hint">${escapeHtml(hint)}</span>` : ""}</td>
           <td>${escapeHtml(record.state)}</td>
           <td>${record.pid}</td>
           <td>${escapeHtml(record.processName)}</td>
           <td><span class="pill ${record.risk === "普通" ? "ok" : "warn"}">${escapeHtml(record.risk)}</span></td>
           <td><button class="icon-action" data-action="kill-port" data-pid="${record.pid}" title="结束进程">${icon(Trash2)}</button></td>
         </tr>
-      `,
+      `;
+      },
     )
     .join("");
+  updateSortHeaders();
+}
+
+function canUninstallExternal(runtime: RuntimeInfo) {
+  const source = runtime.source.toLowerCase();
+  return (
+    !source.includes("devenv") &&
+    ["Java", "Python", "Node.js", "Maven", "Gradle"].includes(runtime.kind)
+  );
+}
+
+function renderHealth() {
+  const element = document.querySelector<HTMLElement>("#env-health");
+  if (!element) return;
+  element.innerHTML = state.health.length
+    ? state.health
+        .map(
+          (item) => `
+            <article class="runtime health-item ${item.status === "正常" ? "ok" : "warn"}">
+              <div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.status)}</span></div>
+              <small>${escapeHtml(item.detail)}</small>
+            </article>
+          `,
+        )
+        .join("")
+    : `<div class="empty">还没有环境健康检查结果</div>`;
+}
+
+function filteredPorts(records: PortRecord[]) {
+  const terms = expandPortQuery(portState.query);
+  return records.filter((record) => {
+    const hint = portHint(record).toLowerCase();
+    const text = [
+      record.protocol,
+      record.localAddress,
+      record.localPort,
+      record.state,
+      record.pid,
+      record.processName,
+      record.risk,
+      hint,
+    ]
+      .join(" ")
+      .toLowerCase();
+    const queryMatch = terms.length === 0 || terms.every((term) => text.includes(term));
+    const quickMatch =
+      portState.quickFilter === "all" ||
+      (portState.quickFilter === "sensitive" && record.risk !== "普通") ||
+      commonPorts.some(
+        (item) =>
+          item.key === portState.quickFilter &&
+          (item.ports.includes(record.localPort) ||
+            item.keywords.some((keyword) => record.processName.toLowerCase().includes(keyword))),
+      );
+    return queryMatch && quickMatch;
+  });
+}
+
+function expandPortQuery(query: string) {
+  return query
+    .trim()
+    .toLowerCase()
+    .split(/[\s,;，；]+/)
+    .filter(Boolean)
+    .flatMap((term) => portAliases[term] || [term]);
+}
+
+function sortedPorts(records: PortRecord[]) {
+  return records.slice().sort((a, b) => {
+    const left = a[portState.sortKey];
+    const right = b[portState.sortKey];
+    const result =
+      typeof left === "number" && typeof right === "number"
+        ? left - right
+        : String(left).localeCompare(String(right), "zh-Hans-CN", { numeric: true, sensitivity: "base" });
+    return portState.sortDirection === "asc" ? result : -result;
+  });
+}
+
+function portHint(record: PortRecord) {
+  const exact = commonPorts.filter((item) => item.ports.includes(record.localPort)).map((item) => item.label);
+  if (record.risk !== "普通") exact.push(record.risk);
+  return [...new Set(exact)].join(" / ");
+}
+
+function updateSortHeaders() {
+  document.querySelectorAll<HTMLButtonElement>(".sort-head").forEach((button) => {
+    const key = button.dataset.sort;
+    const active = key === portState.sortKey;
+    button.classList.toggle("active", active);
+    button.dataset.direction = active ? portState.sortDirection : "";
+  });
 }
 
 function renderProjectHealth(health: ProjectHealth) {
@@ -601,24 +785,45 @@ function renderProjectHealth(health: ProjectHealth) {
   `;
 }
 
-async function refreshAll() {
-  const [snapshot, config, envSnapshot, runtimes, ports] = await Promise.all([
+async function refreshBase() {
+  const [snapshot, config, envSnapshot] = await Promise.all([
     invoke<AppSnapshot>("app_snapshot"),
     invoke<ConfigView>("load_config"),
     invoke<EnvSnapshot>("env_snapshot"),
-    invoke<RuntimeInfo[]>("discover_runtimes"),
-    invoke<PortRecord[]>("scan_ports"),
   ]);
 
   state.snapshot = snapshot;
   state.config = config;
   state.env = envSnapshot;
-  state.runtimes = runtimes;
-  state.ports = ports;
   renderSnapshot();
   renderEnv();
+  renderHealth();
   renderRuntimes();
   renderPorts();
+}
+
+async function refreshRuntimeAndPorts(silent = false) {
+  try {
+    const [runtimes, ports] = await Promise.all([
+      invoke<RuntimeInfo[]>("discover_runtimes"),
+      invoke<PortRecord[]>("scan_ports"),
+    ]);
+    state.runtimes = runtimes;
+    state.ports = ports;
+    renderRuntimes();
+    renderPorts();
+  } catch (error) {
+    if (!silent) {
+      showToast(error instanceof Error ? error.message : String(error), true);
+    }
+  }
+}
+
+async function refreshAll(deep = false) {
+  await refreshBase();
+  if (deep) {
+    await refreshRuntimeAndPorts();
+  }
 }
 
 async function runOperation(action: () => Promise<OperationResult | KillResult | ConfigView>, pending: string) {
@@ -630,7 +835,37 @@ async function runOperation(action: () => Promise<OperationResult | KillResult |
     } else {
       showToast("操作完成");
     }
-    await refreshAll();
+    await refreshBase();
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function runRuntimeOperation(
+  action: () => Promise<OperationResult | KillResult | ConfigView>,
+  pending: string,
+  focus: string,
+) {
+  showToast(pending);
+  try {
+    const result = await action();
+    const message = "message" in result ? result.message : "操作完成";
+    showToast(`${message}，正在验证`);
+    await refreshBase();
+    const [health, runtimes] = await Promise.all([
+      invoke<EnvHealthCheck[]>("environment_health"),
+      invoke<RuntimeInfo[]>("discover_runtimes"),
+    ]);
+    state.health = health;
+    state.runtimes = runtimes;
+    renderHealth();
+    renderRuntimes();
+    const check = health.find((item) => item.name.toLowerCase() === focus.toLowerCase());
+    if (check && check.status !== "正常") {
+      showToast(`${message}；${focus} 验证结果：${check.status}，${check.detail}`, true);
+    } else {
+      showToast(`${message}；${focus} 验证通过`);
+    }
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error), true);
   }
@@ -721,7 +956,7 @@ document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) => {
   button.addEventListener("click", () => activateView(button.dataset.view || "overview"));
 });
 
-document.querySelector("#refresh-all")?.addEventListener("click", () => void refreshAll());
+document.querySelector("#refresh-all")?.addEventListener("click", () => void refreshAll(true));
 document.querySelector("#save-root")?.addEventListener("click", () => {
   const input = document.querySelector<HTMLInputElement>("#root-dir");
   if (!input) return;
@@ -738,35 +973,51 @@ document.querySelector("#discover-runtimes")?.addEventListener("click", async ()
 document.querySelector("#install-jdk")?.addEventListener("click", () => {
   const select = document.querySelector<HTMLSelectElement>("#jdk-version");
   if (!select) return;
-  void runOperation(
+  void runRuntimeOperation(
     () => invoke<OperationResult>("install_jdk", { version: select.value }),
     `正在安装 JDK ${select.value}`,
+    "JDK",
   );
 });
 document.querySelector("#install-node")?.addEventListener("click", () => {
   const select = document.querySelector<HTMLSelectElement>("#node-version");
   if (!select) return;
-  void runOperation(
+  void runRuntimeOperation(
     () => invoke<OperationResult>("install_node", { version: select.value }),
     `正在安装 Node.js ${select.value}`,
+    "Node.js",
   );
 });
 document.querySelector("#install-python")?.addEventListener("click", () => {
   const select = document.querySelector<HTMLSelectElement>("#python-version");
   if (!select) return;
-  void runOperation(
+  void runRuntimeOperation(
     () => invoke<OperationResult>("install_python", { version: select.value }),
     `正在安装 Python ${select.value}`,
+    "Python",
   );
 });
 document.querySelector("#install-maven")?.addEventListener("click", () => {
-  void runOperation(() => invoke<OperationResult>("install_maven_latest"), "正在安装 Maven 最新版");
+  void runRuntimeOperation(() => invoke<OperationResult>("install_maven_latest"), "正在安装 Maven 最新版", "Maven");
 });
 document.querySelector("#install-gradle")?.addEventListener("click", () => {
-  void runOperation(() => invoke<OperationResult>("install_gradle_latest"), "正在安装 Gradle 最新版");
+  void runRuntimeOperation(() => invoke<OperationResult>("install_gradle_latest"), "正在安装 Gradle 最新版", "Gradle");
 });
 document.querySelector("#configure-env")?.addEventListener("click", () => {
   void runOperation(() => invoke<OperationResult>("configure_user_environment"), "正在配置用户环境变量");
+});
+document.querySelector("#check-env-health")?.addEventListener("click", async () => {
+  showToast("正在检查环境配置");
+  try {
+    state.health = await invoke<EnvHealthCheck[]>("environment_health");
+    renderHealth();
+    showToast("环境检查完成");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+document.querySelector("#cleanup-path")?.addEventListener("click", () => {
+  void runOperation(() => invoke<OperationResult>("cleanup_path_entries"), "正在清理真实失效和重复 PATH");
 });
 document.querySelector("#restore-env")?.addEventListener("click", () => {
   void runOperation(() => invoke<OperationResult>("restore_user_environment"), "正在恢复用户环境变量");
@@ -787,6 +1038,11 @@ document.querySelector("#load-cache")?.addEventListener("click", async () => {
 });
 document.querySelector("#clear-cache")?.addEventListener("click", () => {
   void runOperation(() => invoke<OperationResult>("clear_download_cache"), "正在清理下载缓存");
+});
+document.querySelector("#self-uninstall")?.addEventListener("click", () => {
+  const ok = window.confirm("这会启动 DevEnv Manager 的卸载程序并关闭当前程序。确定继续吗？");
+  if (!ok) return;
+  void runOperation(() => invoke<OperationResult>("self_uninstall"), "正在启动卸载程序");
 });
 document.querySelector("#run-command")?.addEventListener("click", async () => {
   const command = document.querySelector<HTMLInputElement>("#command-input")?.value || "";
@@ -821,66 +1077,114 @@ document.querySelector("#generate-vscode")?.addEventListener("click", () => {
   );
 });
 
+document.querySelector("#port-search")?.addEventListener("input", (event) => {
+  portState.query = (event.target as HTMLInputElement).value;
+  renderPorts();
+});
+
+document.querySelector("#port-quick-filters")?.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-port-filter]");
+  if (!button) return;
+  portState.quickFilter = button.dataset.portFilter || "all";
+  document.querySelectorAll(".filter-chip").forEach((item) => item.classList.toggle("active", item === button));
+  renderPorts();
+});
+
+document.querySelectorAll<HTMLButtonElement>(".sort-head").forEach((button) => {
+  button.addEventListener("click", () => {
+    const key = button.dataset.sort as PortSortKey;
+    if (portState.sortKey === key) {
+      portState.sortDirection = portState.sortDirection === "asc" ? "desc" : "asc";
+    } else {
+      portState.sortKey = key;
+      portState.sortDirection = ["localPort", "pid"].includes(key) ? "asc" : "asc";
+    }
+    renderPorts();
+  });
+});
+
 document.addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-action]");
   if (!button) return;
   const action = button.dataset.action;
   if (action === "switch-jdk") {
     const version = button.dataset.version || "";
-    void runOperation(
-      () => invoke<OperationResult>("switch_runtime", { kind: "jdk", version }),
+    const path = button.dataset.path || null;
+    void runRuntimeOperation(
+      () => invoke<OperationResult>("switch_runtime", { kind: "jdk", version, path }),
       `正在切换 JDK ${version}`,
+      "JDK",
     );
   }
   if (action === "uninstall-jdk") {
     const version = button.dataset.version || "";
+    const path = button.dataset.path || null;
     void runOperation(
-      () => invoke<OperationResult>("uninstall_runtime", { kind: "jdk", version }),
+      () => invoke<OperationResult>("uninstall_runtime", { kind: "jdk", version, path }),
       `正在卸载 JDK ${version}`,
     );
   }
   if (action === "switch-node") {
     const version = button.dataset.version || "";
-    void runOperation(
-      () => invoke<OperationResult>("switch_runtime", { kind: "node", version }),
+    const path = button.dataset.path || null;
+    void runRuntimeOperation(
+      () => invoke<OperationResult>("switch_runtime", { kind: "node", version, path }),
       `正在切换 Node.js ${version}`,
+      "Node.js",
     );
   }
   if (action === "uninstall-node") {
     const version = button.dataset.version || "";
+    const path = button.dataset.path || null;
     void runOperation(
-      () => invoke<OperationResult>("uninstall_runtime", { kind: "node", version }),
+      () => invoke<OperationResult>("uninstall_runtime", { kind: "node", version, path }),
       `正在卸载 Node.js ${version}`,
     );
   }
   if (action === "switch-python") {
     const version = button.dataset.version || "";
-    void runOperation(
-      () => invoke<OperationResult>("switch_runtime", { kind: "python", version }),
+    const path = button.dataset.path || null;
+    void runRuntimeOperation(
+      () => invoke<OperationResult>("switch_runtime", { kind: "python", version, path }),
       `正在切换 Python ${version}`,
+      "Python",
     );
   }
   if (action === "uninstall-python") {
     const version = button.dataset.version || "";
+    const path = button.dataset.path || null;
     void runOperation(
-      () => invoke<OperationResult>("uninstall_runtime", { kind: "python", version }),
+      () => invoke<OperationResult>("uninstall_runtime", { kind: "python", version, path }),
       `正在卸载 Python ${version}`,
     );
   }
   if (action === "switch-build-tool") {
     const kind = button.dataset.kind || "";
     const version = button.dataset.version || "";
-    void runOperation(
-      () => invoke<OperationResult>("switch_runtime", { kind, version }),
+    const path = button.dataset.path || null;
+    void runRuntimeOperation(
+      () => invoke<OperationResult>("switch_runtime", { kind, version, path }),
       `正在切换 ${kind} ${version}`,
+      kind === "maven" ? "Maven" : "Gradle",
     );
   }
   if (action === "uninstall-build-tool") {
     const kind = button.dataset.kind || "";
     const version = button.dataset.version || "";
+    const path = button.dataset.path || null;
     void runOperation(
-      () => invoke<OperationResult>("uninstall_runtime", { kind, version }),
+      () => invoke<OperationResult>("uninstall_runtime", { kind, version, path }),
       `正在卸载 ${kind} ${version}`,
+    );
+  }
+  if (action === "uninstall-external-runtime") {
+    const kind = button.dataset.kind || "";
+    const executable = button.dataset.executable || "";
+    const ok = window.confirm(`将启动 Windows 卸载器来卸载 ${kind}。\n\n${executable}\n\n确定继续吗？`);
+    if (!ok) return;
+    void runOperation(
+      () => invoke<OperationResult>("uninstall_external_runtime", { kind, executable }),
+      `正在启动 ${kind} 的系统卸载程序`,
     );
   }
   if (action === "kill-port") {
@@ -893,4 +1197,6 @@ document.addEventListener("click", (event) => {
 });
 
 void listen<TaskProgress>("task-progress", (event) => renderProgress(event.payload));
-void refreshAll();
+void refreshAll(false).then(() => {
+  window.setTimeout(() => void refreshRuntimeAndPorts(true), 350);
+});
