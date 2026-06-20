@@ -20,13 +20,14 @@ use std::os::windows::process::CommandExt;
 use winreg::{enums::*, RegKey};
 
 const APP_NAME: &str = "DevEnvManager";
-const MANAGED_PATHS: [&str; 7] = [
+const MANAGED_PATHS: [&str; 8] = [
     r"%DEVENV_HOME%\current\jdk\bin",
     r"%DEVENV_HOME%\current\python",
     r"%DEVENV_HOME%\current\python\Scripts",
     r"%DEVENV_HOME%\current\node",
     r"%DEVENV_HOME%\current\maven\bin",
     r"%DEVENV_HOME%\current\gradle\bin",
+    r"%DEVENV_HOME%\current\go\bin",
     r"%DEVENV_HOME%\tools\npm-global",
 ];
 const BLOCKED_PIDS: [u32; 2] = [0, 4];
@@ -42,7 +43,7 @@ const BLOCKED_NAMES: [&str; 9] = [
     "lsass.exe",
 ];
 const CAUTION_NAMES: [&str; 1] = ["svchost.exe"];
-const ALLOWED_DOWNLOAD_HOSTS: [&str; 11] = [
+const ALLOWED_DOWNLOAD_HOSTS: [&str; 12] = [
     "api.adoptium.net",
     "github.com",
     "objects.githubusercontent.com",
@@ -54,6 +55,7 @@ const ALLOWED_DOWNLOAD_HOSTS: [&str; 11] = [
     "archive.apache.org",
     "services.gradle.org",
     "downloads.gradle.org",
+    "go.dev",
 ];
 
 #[derive(Debug, Clone)]
@@ -80,6 +82,8 @@ struct InstalledData {
     nodes: Vec<Value>,
     mavens: Vec<Value>,
     gradles: Vec<Value>,
+    #[serde(default)]
+    gos: Vec<Value>,
     current: CurrentVersions,
 }
 
@@ -90,6 +94,7 @@ struct CurrentVersions {
     node: Option<String>,
     maven: Option<String>,
     gradle: Option<String>,
+    go: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -114,6 +119,7 @@ struct PathSummary {
     nodes: String,
     mavens: String,
     gradles: String,
+    gos: String,
     current: String,
     downloads: String,
     config: String,
@@ -383,6 +389,58 @@ struct ToolchainReport {
     generated_at: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoEnvironment {
+    go: ToolState,
+    goroot: String,
+    gopath: String,
+    goproxy: String,
+    gomodcache: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RustEnvironment {
+    tools: Vec<ToolState>,
+    default_toolchain: String,
+    installed_toolchains: Vec<String>,
+    msvc_build_tools: String,
+    cargo_config_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DotnetEnvironment {
+    dotnet: ToolState,
+    sdks: Vec<String>,
+    runtimes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MirrorCenter {
+    npm_registry: String,
+    pip_index_url: String,
+    go_proxy: String,
+    maven_settings_path: String,
+    maven_settings_exists: bool,
+    gradle_init_path: String,
+    gradle_init_exists: bool,
+    cargo_config_path: String,
+    cargo_config_exists: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlatformReport {
+    go: GoEnvironment,
+    rust: RustEnvironment,
+    dotnet: DotnetEnvironment,
+    mirrors: MirrorCenter,
+    generated_at: String,
+}
+
 #[derive(Debug, Clone)]
 struct UninstallEntry {
     display_name: String,
@@ -602,6 +660,10 @@ fn discover_runtimes_blocking() -> Vec<RuntimeInfo> {
         ("npm", "npm", vec!["--version"]),
         ("Maven", "mvn", vec!["--version"]),
         ("Gradle", "gradle", vec!["--version"]),
+        ("Go", "go", vec!["version"]),
+        ("Rust", "rustc", vec!["--version"]),
+        ("Cargo", "cargo", vec!["--version"]),
+        (".NET SDK", "dotnet", vec!["--version"]),
     ] {
         for candidate in find_all_on_path(exe) {
             if let Some(info) = detect_runtime_at(kind, &candidate, &args, None) {
@@ -733,6 +795,58 @@ fn install_node_blocking(app: tauri::AppHandle, version: String) -> Result<Opera
     Ok(OperationResult {
         success: true,
         message: format!("安装成功 Node.js {version}"),
+    })
+}
+
+#[tauri::command]
+async fn install_go(app: tauri::AppHandle, version: String) -> Result<OperationResult, String> {
+    run_blocking(move || install_go_blocking(app, version)).await?
+}
+
+fn install_go_blocking(app: tauri::AppHandle, version: String) -> Result<OperationResult, String> {
+    let version = version.trim();
+    let task = format!("Go {version}");
+    emit_task_progress(&app, &task, 2, "正在准备安装");
+    if !["1.22", "1.23", "1.24", "1.25", "1.26"].contains(&version) {
+        return Err(format!("暂不支持 Go {version}"));
+    }
+    let paths = load_paths()?;
+    paths.ensure().map_err(|err| err.to_string())?;
+    emit_task_progress(&app, &task, 8, "正在查询 Go 官方版本");
+    let release = resolve_go_release(version)?;
+    let archive = paths.downloads().join(&release.name);
+    let target = paths.gos().join(format!("go-{version}"));
+    paths.assert_inside_root(&target)?;
+    if target.exists() {
+        return Err(format!("Go {version} 已安装：{}", display_path(&target)));
+    }
+    emit_task_progress(&app, &task, 18, "正在下载 Go");
+    download_file_with_progress(
+        &release.url,
+        &archive,
+        release.sha256.as_deref(),
+        Some((&app, &task, 18, 70)),
+    )?;
+    emit_task_progress(&app, &task, 72, "正在解压 Go");
+    install_zip_payload(&archive, &target, &["bin/go.exe"])?;
+    emit_task_progress(&app, &task, 88, "正在验证 Go");
+    let output = run_command_output(target.join("bin/go.exe"), &["version"], 30)?;
+    record_install(
+        &paths,
+        runtime_meta("go")?,
+        version,
+        &target,
+        &target.join("bin/go.exe"),
+        json!({
+            "detail": output.lines().next().unwrap_or(&release.tag),
+            "tag": release.tag,
+        }),
+    )?;
+    switch_runtime_blocking("go".to_string(), version.to_string(), None)?;
+    emit_task_progress(&app, &task, 100, "安装完成");
+    Ok(OperationResult {
+        success: true,
+        message: format!("安装成功 Go {version}"),
     })
 }
 
@@ -1356,6 +1470,13 @@ fn environment_health_blocking() -> Result<Vec<EnvHealthCheck>, String> {
         &paths.current().join("gradle/bin/gradle.bat"),
         &["-v"],
     ));
+    if load_installed(&paths)?.current.go.is_some() {
+        checks.push(check_executable_health(
+            "Go",
+            &paths.current().join("go/bin/go.exe"),
+            &["version"],
+        ));
+    }
 
     Ok(checks)
 }
@@ -2043,6 +2164,198 @@ fn toolchain_action_title(action: &str) -> &'static str {
 }
 
 #[tauri::command]
+async fn inspect_platform_toolchains() -> Result<PlatformReport, String> {
+    run_blocking(inspect_platform_toolchains_blocking).await?
+}
+
+fn inspect_platform_toolchains_blocking() -> Result<PlatformReport, String> {
+    let paths = load_paths()?;
+    let go_executable = resolve_tool(&paths, "go");
+    let go = probe_tool("Go", go_executable.clone(), &["version"]);
+    let go_value = |key: &str| command_value(go_executable.clone(), &["env", key]);
+    let user_env = user_environment().unwrap_or_default();
+
+    let rustup = resolve_tool(&paths, "rustup");
+    let rustc = resolve_tool(&paths, "rustc");
+    let cargo = resolve_tool(&paths, "cargo");
+    let rust_tools = vec![
+        probe_tool("rustup", rustup.clone(), &["--version"]),
+        probe_tool("rustc", rustc, &["--version"]),
+        probe_tool("Cargo", cargo, &["--version"]),
+    ];
+    let default_toolchain = command_value(rustup.clone(), &["show", "active-toolchain"]);
+    let installed_toolchains = command_value(rustup, &["toolchain", "list"])
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let cargo_config_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".cargo/config.toml");
+
+    let dotnet_executable = resolve_tool(&paths, "dotnet");
+    let dotnet = probe_tool(".NET SDK", dotnet_executable.clone(), &["--version"]);
+    let sdks = command_value(dotnet_executable.clone(), &["--list-sdks"])
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let runtimes = command_value(dotnet_executable, &["--list-runtimes"])
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let npm_registry = command_value(resolve_tool(&paths, "npm"), &["config", "get", "registry"]);
+    let python = resolve_tool(&paths, "python");
+    let pip_config = command_value(python, &["-m", "pip", "config", "list"]);
+    let home = dirs::home_dir().unwrap_or_default();
+    let maven_settings_path = home.join(".m2/settings.xml");
+    let gradle_init_path = home.join(".gradle/init.gradle");
+
+    Ok(PlatformReport {
+        go: GoEnvironment {
+            go,
+            goroot: go_value("GOROOT"),
+            gopath: go_value("GOPATH"),
+            goproxy: user_env
+                .get("GOPROXY")
+                .cloned()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| go_value("GOPROXY")),
+            gomodcache: go_value("GOMODCACHE"),
+        },
+        rust: RustEnvironment {
+            tools: rust_tools,
+            default_toolchain,
+            installed_toolchains,
+            msvc_build_tools: detect_msvc_build_tools(),
+            cargo_config_path: display_path(&cargo_config_path),
+        },
+        dotnet: DotnetEnvironment { dotnet, sdks, runtimes },
+        mirrors: MirrorCenter {
+            npm_registry,
+            pip_index_url: pip_config_value(&pip_config, "global.index-url"),
+            go_proxy: user_env
+                .get("GOPROXY")
+                .cloned()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| go_value("GOPROXY")),
+            maven_settings_path: display_path(&maven_settings_path),
+            maven_settings_exists: maven_settings_path.is_file(),
+            gradle_init_path: display_path(&gradle_init_path),
+            gradle_init_exists: gradle_init_path.is_file(),
+            cargo_config_path: display_path(&cargo_config_path),
+            cargo_config_exists: cargo_config_path.is_file(),
+        },
+        generated_at: current_timestamp(),
+    })
+}
+
+#[tauri::command]
+async fn run_platform_action(
+    app: tauri::AppHandle,
+    action: String,
+    value: Option<String>,
+) -> Result<OperationResult, String> {
+    let task = platform_action_title(&action).to_string();
+    emit_task_progress(&app, &task, 5, "正在准备操作");
+    let worker_action = action.clone();
+    let result = run_blocking(move || run_platform_action_blocking(&worker_action, value)).await?;
+    emit_task_progress(
+        &app,
+        &task,
+        100,
+        if result.is_ok() { "操作完成" } else { "操作失败" },
+    );
+    result
+}
+
+fn run_platform_action_blocking(action: &str, value: Option<String>) -> Result<OperationResult, String> {
+    let paths = load_paths()?;
+    let required = |name: &str| {
+        resolve_tool(&paths, name).ok_or_else(|| format!("没有找到 {name}，请先安装并刷新平台诊断"))
+    };
+    let message = match action {
+        "go_proxy" => {
+            let proxy = match value.as_deref() {
+                Some("official") => "https://proxy.golang.org,direct",
+                Some("goproxy_cn") => "https://goproxy.cn,direct",
+                Some("direct") => "direct",
+                _ => return Err("不支持的 Go 代理".to_string()),
+            };
+            set_user_environment_variable("GOPROXY", Some(proxy))?;
+            broadcast_environment_change();
+            format!("当前用户 GOPROXY 已设置为 {proxy}")
+        }
+        "rust_default_stable" => {
+            run_action_command(&paths, required("rustup")?, &["default", "stable"])?;
+            "Rust 默认工具链已切换为 stable".to_string()
+        }
+        "rust_update" => {
+            run_action_command(&paths, required("rustup")?, &["update"])?;
+            "rustup 工具链更新完成".to_string()
+        }
+        "maven_mirror" => {
+            let mirror = match value.as_deref() {
+                Some("official") => None,
+                Some("aliyun") => Some(("aliyun", "https://maven.aliyun.com/repository/public")),
+                _ => return Err("不支持的 Maven 镜像".to_string()),
+            };
+            let target = dirs::home_dir()
+                .ok_or_else(|| "无法定位用户目录".to_string())?
+                .join(".m2/settings.xml");
+            let backup = backup_before_write(&target)?;
+            write_maven_settings(&target, mirror)?;
+            config_write_message("Maven settings.xml", &target, backup.as_deref())
+        }
+        "gradle_mirror" => {
+            let mirror = match value.as_deref() {
+                Some("official") => None,
+                Some("aliyun") => Some("https://maven.aliyun.com/repository/public"),
+                _ => return Err("不支持的 Gradle 镜像".to_string()),
+            };
+            let target = dirs::home_dir()
+                .ok_or_else(|| "无法定位用户目录".to_string())?
+                .join(".gradle/init.gradle");
+            let backup = backup_before_write(&target)?;
+            write_gradle_init(&target, mirror)?;
+            config_write_message("Gradle init.gradle", &target, backup.as_deref())
+        }
+        "restore_maven_config" => {
+            let target = dirs::home_dir()
+                .ok_or_else(|| "无法定位用户目录".to_string())?
+                .join(".m2/settings.xml");
+            restore_latest_backup(&target)?
+        }
+        "restore_gradle_config" => {
+            let target = dirs::home_dir()
+                .ok_or_else(|| "无法定位用户目录".to_string())?
+                .join(".gradle/init.gradle");
+            restore_latest_backup(&target)?
+        }
+        _ => return Err("不支持的平台工具链操作".to_string()),
+    };
+    Ok(OperationResult { success: true, message })
+}
+
+fn platform_action_title(action: &str) -> &'static str {
+    match action {
+        "go_proxy" => "切换 Go 代理",
+        "rust_default_stable" => "切换 Rust stable",
+        "rust_update" => "更新 Rust 工具链",
+        "maven_mirror" => "配置 Maven 镜像",
+        "gradle_mirror" => "配置 Gradle 镜像",
+        "restore_maven_config" => "恢复 Maven 配置",
+        "restore_gradle_config" => "恢复 Gradle 配置",
+        _ => "平台工具链操作",
+    }
+}
+
+#[tauri::command]
 fn analyze_project(path: String) -> Result<ProjectAnalysis, String> {
     analyze_project_blocking(&PathBuf::from(path.trim()))
 }
@@ -2093,6 +2406,7 @@ fn analyze_project_blocking(root: &Path) -> Result<ProjectAnalysis, String> {
         push_unique(&mut project_types, "Rust");
         recommendations.push(runtime_recommendation("Rust", "建议 rustup stable + MSVC Build Tools", "rustc"));
         actions.push(project_action("cargo_test", "Cargo 测试", "cargo test", "运行 Rust 测试", true));
+        actions.push(project_action("cargo_check", "Cargo 检查", "cargo check", "检查 Rust 项目但不生成最终产物", true));
     }
     if has("src-tauri/tauri.conf.json") {
         push_unique(&mut project_types, "Tauri");
@@ -2103,7 +2417,22 @@ fn analyze_project_blocking(root: &Path) -> Result<ProjectAnalysis, String> {
     }
     if signals.iter().any(|item| item.ends_with(".csproj") || item.ends_with(".sln")) {
         push_unique(&mut project_types, ".NET");
-        recommendations.push(runtime_recommendation(".NET SDK", "需要 dotnet SDK", "dotnet"));
+        if let Some(required) = dotnet_required_sdk(root) {
+            let installed = command_value(find_on_path("dotnet").map(PathBuf::from), &["--list-sdks"]);
+            recommendations.push(ProjectRuntimeRecommendation {
+                name: ".NET SDK".to_string(),
+                requirement: format!("global.json 要求 SDK {required}"),
+                status: if installed.lines().any(|line| line.starts_with(&required)) {
+                    "版本匹配".to_string()
+                } else {
+                    "缺少指定版本".to_string()
+                },
+            });
+        } else {
+            recommendations.push(runtime_recommendation(".NET SDK", "需要 dotnet SDK", "dotnet"));
+        }
+        actions.push(project_action("dotnet_restore", ".NET 还原", "dotnet restore", "还原 NuGet 依赖", true));
+        actions.push(project_action("dotnet_build", ".NET 构建", "dotnet build", "构建 .NET 项目", true));
         actions.push(project_action("dotnet_test", ".NET 测试", "dotnet test", "运行 .NET 测试", true));
     }
     if has("go.mod") {
@@ -2260,6 +2589,7 @@ fn apply_config_profile_blocking(id: String) -> Result<OperationResult, String> 
         ("node", profile.current.node.clone()),
         ("maven", profile.current.maven.clone()),
         ("gradle", profile.current.gradle.clone()),
+        ("go", profile.current.go.clone()),
     ];
     let mut applied = Vec::new();
     for (kind, version) in switches {
@@ -2399,6 +2729,7 @@ pub fn run() {
             discover_runtimes,
             install_jdk,
             install_node,
+            install_go,
             install_python,
             install_maven_latest,
             install_gradle_latest,
@@ -2411,6 +2742,8 @@ pub fn run() {
             analyze_python_environment,
             inspect_toolchains,
             run_toolchain_action,
+            inspect_platform_toolchains,
+            run_platform_action,
             project_health,
             analyze_project,
             run_project_action,
@@ -2454,6 +2787,9 @@ impl AppPaths {
     fn gradles(&self) -> PathBuf {
         self.envs().join("gradles")
     }
+    fn gos(&self) -> PathBuf {
+        self.envs().join("gos")
+    }
     fn tools(&self) -> PathBuf {
         self.root.join("tools")
     }
@@ -2490,6 +2826,7 @@ impl AppPaths {
             self.nodes(),
             self.mavens(),
             self.gradles(),
+            self.gos(),
             self.tools(),
             self.npm_global(),
             self.current(),
@@ -2524,6 +2861,7 @@ impl AppPaths {
             nodes: display_path(self.nodes()),
             mavens: display_path(self.mavens()),
             gradles: display_path(self.gradles()),
+            gos: display_path(self.gos()),
             current: display_path(self.current()),
             downloads: display_path(self.downloads()),
             config: display_path(self.config()),
@@ -2610,6 +2948,7 @@ fn default_installed() -> InstalledData {
         nodes: Vec::new(),
         mavens: Vec::new(),
         gradles: Vec::new(),
+        gos: Vec::new(),
         current: CurrentVersions::default(),
     }
 }
@@ -2945,6 +3284,68 @@ fn resolve_jdk_release(version: &str) -> Result<ReleaseInfo, String> {
     })
 }
 
+fn resolve_go_release(version: &str) -> Result<ReleaseInfo, String> {
+    let items: Value = reqwest::blocking::get("https://go.dev/dl/?mode=json&include=all")
+        .map_err(|err| format!("查询 Go 版本失败：{err}"))?
+        .error_for_status()
+        .map_err(|err| format!("查询 Go 版本失败：{err}"))?
+        .json()
+        .map_err(|err| format!("解析 Go 版本响应失败：{err}"))?;
+    parse_go_release_index(&items, version)
+}
+
+fn parse_go_release_index(items: &Value, version: &str) -> Result<ReleaseInfo, String> {
+    let release = items
+        .as_array()
+        .ok_or_else(|| "Go 版本索引格式异常".to_string())?
+        .iter()
+        .filter(|item| {
+            item.get("stable").and_then(Value::as_bool).unwrap_or(false)
+                && item
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .map(|tag| tag.trim_start_matches("go").starts_with(&format!("{version}.")))
+                    .unwrap_or(false)
+        })
+        .max_by_key(|item| {
+            item.get("version")
+                .and_then(Value::as_str)
+                .map(version_key)
+                .unwrap_or_default()
+        })
+        .ok_or_else(|| format!("Go 官方索引中没有可用的 {version} 稳定版"))?;
+    let tag = release
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Go 版本响应缺少版本号".to_string())?;
+    let file = release
+        .get("files")
+        .and_then(Value::as_array)
+        .and_then(|files| {
+            files.iter().find(|file| {
+                file.get("os").and_then(Value::as_str) == Some("windows")
+                    && file.get("arch").and_then(Value::as_str) == Some("amd64")
+                    && file.get("kind").and_then(Value::as_str) == Some("archive")
+                    && file
+                        .get("filename")
+                        .and_then(Value::as_str)
+                        .map(|name| name.ends_with(".zip"))
+                        .unwrap_or(false)
+            })
+        })
+        .ok_or_else(|| format!("没有找到 {tag} 的 Windows x64 ZIP"))?;
+    let name = file
+        .get("filename")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Go 下载项缺少文件名".to_string())?;
+    Ok(ReleaseInfo {
+        name: name.to_string(),
+        url: format!("https://go.dev/dl/{name}"),
+        sha256: file.get("sha256").and_then(Value::as_str).map(str::to_string),
+        tag: tag.to_string(),
+    })
+}
+
 fn resolve_node_release(version: &str) -> Result<ReleaseInfo, String> {
     let items: Value = reqwest::blocking::get("https://nodejs.org/dist/index.json")
         .map_err(|err| format!("查询 Node.js 失败：{err}"))?
@@ -3143,16 +3544,20 @@ fn download_file_with_progress(
     progress: Option<(&tauri::AppHandle, &str, u8, u8)>,
 ) -> Result<(), String> {
     validate_download_url(url)?;
-    if target_path.exists() && target_path.metadata().map(|item| item.len()).unwrap_or(0) > 0 {
-        if expected_sha256
-            .map(|expected| file_sha256(target_path).ok().as_deref() == Some(&expected.to_ascii_lowercase()))
-            .unwrap_or(true)
-        {
-            if let Some((app, task, _, end)) = progress {
-                emit_task_progress(app, task, end, "使用已有下载缓存");
-            }
-            return Ok(());
+    let cache_valid = target_path.exists()
+        && target_path.metadata().map(|item| item.len()).unwrap_or(0) > 0
+        && expected_sha256
+            .map(|expected| {
+                file_sha256(target_path)
+                    .map(|actual| actual.eq_ignore_ascii_case(expected))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true);
+    if cache_valid {
+        if let Some((app, task, _, end)) = progress {
+            emit_task_progress(app, task, end, "使用已有下载缓存");
         }
+        return Ok(());
     }
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("创建下载目录失败：{err}"))?;
@@ -3190,9 +3595,9 @@ fn download_file_with_progress(
         hasher.update(&buffer[..read]);
         downloaded += read as u64;
         if let (Some(total), Some((app, task, start, end))) = (total, progress) {
-            if total > 0 {
-                let span = end.saturating_sub(start) as u64;
-                let percent = start.saturating_add(((downloaded.saturating_mul(span)) / total) as u8).min(end);
+            let span = end.saturating_sub(start) as u64;
+            if let Some(completed) = downloaded.saturating_mul(span).checked_div(total) {
+                let percent = start.saturating_add(completed as u8).min(end);
                 if percent >= last_percent.saturating_add(3) || percent >= end {
                     last_percent = percent;
                     emit_task_progress(
@@ -3210,7 +3615,7 @@ fn download_file_with_progress(
     }
     if let Some(expected) = expected_sha256 {
         let actual = format!("{:x}", hasher.finalize());
-        if actual.to_ascii_lowercase() != expected.to_ascii_lowercase() {
+        if !actual.eq_ignore_ascii_case(expected) {
             let _ = fs::remove_file(&temp_path);
             return Err("SHA-256 校验失败，文件可能不完整".to_string());
         }
@@ -3381,6 +3786,12 @@ fn runtime_meta(kind: &str) -> Result<RuntimeMeta, String> {
             link_name: "gradle",
             exe_key: "gradle_exe",
         }),
+        "go" => Ok(RuntimeMeta {
+            kind: "go",
+            collection: "gos",
+            link_name: "go",
+            exe_key: "go_exe",
+        }),
         _ => Err(format!("未知运行时类型：{kind}")),
     }
 }
@@ -3392,6 +3803,7 @@ fn collection<'a>(installed: &'a InstalledData, collection: &str) -> &'a Vec<Val
         "nodes" => &installed.nodes,
         "mavens" => &installed.mavens,
         "gradles" => &installed.gradles,
+        "gos" => &installed.gos,
         _ => &installed.jdks,
     }
 }
@@ -3403,6 +3815,7 @@ fn collection_mut<'a>(installed: &'a mut InstalledData, collection: &str) -> &'a
         "nodes" => &mut installed.nodes,
         "mavens" => &mut installed.mavens,
         "gradles" => &mut installed.gradles,
+        "gos" => &mut installed.gos,
         _ => &mut installed.jdks,
     }
 }
@@ -3414,6 +3827,7 @@ fn runtime_parent(paths: &AppPaths, collection: &str) -> Result<PathBuf, String>
         "nodes" => Ok(paths.nodes()),
         "mavens" => Ok(paths.mavens()),
         "gradles" => Ok(paths.gradles()),
+        "gos" => Ok(paths.gos()),
         _ => Err(format!("未知运行时集合：{collection}")),
     }
 }
@@ -3425,6 +3839,7 @@ fn current_version(installed: &InstalledData, kind: &str) -> Option<String> {
         "node" => installed.current.node.clone(),
         "maven" => installed.current.maven.clone(),
         "gradle" => installed.current.gradle.clone(),
+        "go" => installed.current.go.clone(),
         _ => None,
     }
 }
@@ -3436,6 +3851,7 @@ fn set_current(installed: &mut InstalledData, kind: &str, version: Option<String
         "node" => installed.current.node = version,
         "maven" => installed.current.maven = version,
         "gradle" => installed.current.gradle = version,
+        "go" => installed.current.go = version,
         _ => {}
     }
 }
@@ -3568,6 +3984,7 @@ fn add_managed_runtime_discoveries(runtimes: &mut Vec<RuntimeInfo>, paths: &AppP
         ("Node.js", runtime_meta("node")),
         ("Maven", runtime_meta("maven")),
         ("Gradle", runtime_meta("gradle")),
+        ("Go", runtime_meta("go")),
     ] {
         let Ok(meta) = meta else {
             continue;
@@ -3911,6 +4328,7 @@ fn apply_managed_environment(paths: &AppPaths, command: &mut Command) {
         paths.current().join("node"),
         paths.current().join("maven/bin"),
         paths.current().join("gradle/bin"),
+        paths.current().join("go/bin"),
         paths.npm_global(),
     ] {
         entries.push(display_path(item));
@@ -4133,6 +4551,7 @@ fn uninstall_kind_words(kind: &str) -> Vec<&'static str> {
         "node.js" | "node" | "npm" => vec!["node", "node.js"],
         "maven" => vec!["maven"],
         "gradle" => vec!["gradle"],
+        "go" => vec!["go programming language", "golang", "go1."],
         _ => vec![],
     }
 }
@@ -4169,6 +4588,11 @@ fn push_doctor_check(checks: &mut Vec<DoctorCheck>, score: &mut i32, check: Doct
 }
 
 fn optional_command_probe(name: &str, executable: &str, args: &[&str]) -> DoctorCheck {
+    let fix_action = if matches!(name, "Go" | "Rust" | ".NET") {
+        "platforms"
+    } else {
+        "discover_runtimes"
+    };
     match detect_runtime(name, executable, args) {
         Some(info) => DoctorCheck {
             id: format!("tool-{}", slug(name)),
@@ -4177,7 +4601,7 @@ fn optional_command_probe(name: &str, executable: &str, args: &[&str]) -> Doctor
             status: "正常".to_string(),
             severity: "info".to_string(),
             detail: format!("{} · {}", info.version, info.executable),
-            fix_action: Some("discover_runtimes".to_string()),
+            fix_action: Some(fix_action.to_string()),
         },
         None => DoctorCheck {
             id: format!("tool-{}", slug(name)),
@@ -4186,7 +4610,7 @@ fn optional_command_probe(name: &str, executable: &str, args: &[&str]) -> Doctor
             status: "可选缺失".to_string(),
             severity: "info".to_string(),
             detail: format!("没有找到 {executable}；只有对应项目或生态功能需要它"),
-            fix_action: Some("copy_fix_command".to_string()),
+            fix_action: Some(fix_action.to_string()),
         },
     }
 }
@@ -4199,13 +4623,159 @@ fn tool_registry() -> Vec<ToolDefinition> {
         ToolDefinition { id: "maven", name: "Maven", category: "build", exe_names: &["mvn"], env_vars: &["MAVEN_HOME"], managed_path_entries: &[r"%DEVENV_HOME%\current\maven\bin"], supports_install: true, supports_switch: true, supports_mirror: true },
         ToolDefinition { id: "gradle", name: "Gradle", category: "build", exe_names: &["gradle"], env_vars: &["GRADLE_HOME"], managed_path_entries: &[r"%DEVENV_HOME%\current\gradle\bin"], supports_install: true, supports_switch: true, supports_mirror: true },
         ToolDefinition { id: "git", name: "Git", category: "scm", exe_names: &["git", "git-lfs", "ssh"], env_vars: &[], managed_path_entries: &[], supports_install: false, supports_switch: false, supports_mirror: false },
-        ToolDefinition { id: "go", name: "Go", category: "runtime", exe_names: &["go"], env_vars: &["GOROOT", "GOPATH", "GOPROXY"], managed_path_entries: &[], supports_install: false, supports_switch: false, supports_mirror: true },
+        ToolDefinition { id: "go", name: "Go", category: "runtime", exe_names: &["go"], env_vars: &["GOROOT", "GOPATH", "GOPROXY"], managed_path_entries: &[r"%DEVENV_HOME%\current\go\bin"], supports_install: true, supports_switch: true, supports_mirror: true },
         ToolDefinition { id: "rust", name: "Rust", category: "runtime", exe_names: &["rustup", "rustc", "cargo"], env_vars: &["RUSTUP_HOME", "CARGO_HOME"], managed_path_entries: &[], supports_install: false, supports_switch: false, supports_mirror: true },
         ToolDefinition { id: "dotnet", name: ".NET SDK", category: "runtime", exe_names: &["dotnet"], env_vars: &["DOTNET_ROOT"], managed_path_entries: &[], supports_install: false, supports_switch: false, supports_mirror: false },
         ToolDefinition { id: "pnpm", name: "pnpm", category: "node-ecosystem", exe_names: &["pnpm"], env_vars: &["PNPM_HOME"], managed_path_entries: &[], supports_install: true, supports_switch: false, supports_mirror: true },
         ToolDefinition { id: "yarn", name: "Yarn", category: "node-ecosystem", exe_names: &["yarn"], env_vars: &[], managed_path_entries: &[], supports_install: true, supports_switch: false, supports_mirror: true },
         ToolDefinition { id: "python-tools", name: "Python 工具", category: "python-ecosystem", exe_names: &["uv", "poetry", "virtualenv"], env_vars: &[], managed_path_entries: &[], supports_install: true, supports_switch: false, supports_mirror: true },
     ]
+}
+
+fn set_user_environment_variable(name: &str, value: Option<&str>) -> Result<(), String> {
+    if !["GOPROXY"].contains(&name) {
+        return Err("拒绝写入未授权的用户环境变量".to_string());
+    }
+    #[cfg(windows)]
+    {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (env_key, _) = hkcu
+            .create_subkey("Environment")
+            .map_err(|err| format!("打开用户环境变量失败：{err}"))?;
+        if let Some(value) = value {
+            env_key
+                .set_value(name, &value)
+                .map_err(|err| format!("写入 {name} 失败：{err}"))?;
+        } else {
+            let _ = env_key.delete_value(name);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = value;
+        Err("用户环境变量管理仅支持 Windows".to_string())
+    }
+}
+
+fn backup_before_write(target: &Path) -> Result<Option<PathBuf>, String> {
+    let home = dirs::home_dir().ok_or_else(|| "无法定位用户目录".to_string())?;
+    if !target.starts_with(&home) {
+        return Err("拒绝修改用户目录之外的配置文件".to_string());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("创建配置目录失败：{err}"))?;
+    }
+    if !target.exists() {
+        return Ok(None);
+    }
+    let name = target.file_name().and_then(OsStr::to_str).unwrap_or("config");
+    let backup = target.with_file_name(format!("{name}.devenv-backup-{}", filename_timestamp()));
+    fs::copy(target, &backup).map_err(|err| format!("备份配置失败：{err}"))?;
+    Ok(Some(backup))
+}
+
+fn restore_latest_backup(target: &Path) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or_else(|| "无法定位用户目录".to_string())?;
+    if !target.starts_with(&home) {
+        return Err("拒绝恢复用户目录之外的配置文件".to_string());
+    }
+    let parent = target.parent().ok_or_else(|| "配置路径无效".to_string())?;
+    let name = target.file_name().and_then(OsStr::to_str).unwrap_or("config");
+    let prefix = format!("{name}.devenv-backup-");
+    let backup = fs::read_dir(parent)
+        .map_err(|err| format!("读取备份目录失败：{err}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&prefix)
+                && entry.path().is_file()
+        })
+        .max_by_key(|entry| entry.metadata().and_then(|meta| meta.modified()).ok())
+        .map(|entry| entry.path())
+        .ok_or_else(|| format!("没有找到 {name} 的 DevEnv Manager 备份"))?;
+    let current_backup = backup_before_write(target)?;
+    fs::copy(&backup, target).map_err(|err| format!("恢复配置失败：{err}"))?;
+    Ok(match current_backup {
+        Some(current) => format!(
+            "已从 {} 恢复配置；恢复前状态已备份到 {}",
+            display_path(backup),
+            display_path(current)
+        ),
+        None => format!("已从 {} 恢复配置", display_path(backup)),
+    })
+}
+
+fn write_maven_settings(target: &Path, mirror: Option<(&str, &str)>) -> Result<(), String> {
+    fs::write(target, maven_settings_content(mirror))
+        .map_err(|err| format!("写入 Maven 配置失败：{err}"))
+}
+
+fn maven_settings_content(mirror: Option<(&str, &str)>) -> String {
+    let mirror_xml = mirror
+        .map(|(id, url)| {
+            format!(
+                "    <mirror>\n      <id>{id}</id>\n      <name>DevEnv Manager mirror</name>\n      <url>{url}</url>\n      <mirrorOf>*</mirrorOf>\n    </mirror>\n"
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\"\n          xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n          xsi:schemaLocation=\"http://maven.apache.org/SETTINGS/1.2.0 https://maven.apache.org/xsd/settings-1.2.0.xsd\">\n  <!-- Generated by DevEnv Manager. Previous file is backed up before replacement. -->\n  <mirrors>\n{mirror_xml}  </mirrors>\n</settings>\n"
+    )
+}
+
+fn write_gradle_init(target: &Path, mirror: Option<&str>) -> Result<(), String> {
+    fs::write(target, gradle_init_content(mirror))
+        .map_err(|err| format!("写入 Gradle 配置失败：{err}"))
+}
+
+fn gradle_init_content(mirror: Option<&str>) -> String {
+    mirror
+        .map(|url| {
+            format!(
+                "// Generated by DevEnv Manager. Previous file is backed up before replacement.\nallprojects {{\n    repositories {{\n        maven {{ url '{url}' }}\n        mavenCentral()\n        gradlePluginPortal()\n    }}\n}}\n"
+            )
+        })
+        .unwrap_or_else(|| "// Generated by DevEnv Manager. Using Gradle default repositories.\n".to_string())
+}
+
+fn config_write_message(label: &str, target: &Path, backup: Option<&Path>) -> String {
+    match backup {
+        Some(backup) => format!(
+            "已更新 {label}：{}；原配置已备份到 {}",
+            display_path(target),
+            display_path(backup)
+        ),
+        None => format!("已创建 {label}：{}", display_path(target)),
+    }
+}
+
+fn detect_msvc_build_tools() -> String {
+    #[cfg(windows)]
+    {
+        let program_files_x86 = env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
+        let vswhere = PathBuf::from(program_files_x86).join("Microsoft Visual Studio/Installer/vswhere.exe");
+        if vswhere.is_file() {
+            let result = command_value(
+                Some(vswhere),
+                &[
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ],
+            );
+            if !result.trim().is_empty() {
+                return result;
+            }
+        }
+    }
+    "未发现 MSVC Build Tools".to_string()
 }
 
 fn resolve_tool(paths: &AppPaths, executable: &str) -> Option<PathBuf> {
@@ -4217,6 +4787,7 @@ fn resolve_tool(paths: &AppPaths, executable: &str) -> Option<PathBuf> {
         "corepack" => Some(paths.current().join("node/corepack.cmd")),
         "pnpm" => Some(paths.current().join("node/pnpm.cmd")),
         "yarn" => Some(paths.current().join("node/yarn.cmd")),
+        "go" => Some(paths.current().join("go/bin/go.exe")),
         _ => None,
     };
     managed
@@ -4505,6 +5076,11 @@ fn python_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+fn dotnet_required_sdk(root: &Path) -> Option<String> {
+    let value: Value = serde_json::from_str(&fs::read_to_string(root.join("global.json")).ok()?).ok()?;
+    value.pointer("/sdk/version").and_then(Value::as_str).map(str::to_string)
+}
+
 fn project_signals(root: &Path) -> Vec<String> {
     let mut signals = Vec::new();
     for file in [
@@ -4729,5 +5305,50 @@ mod tests {
         assert!(validate_setting(Some(""), "测试值").is_err());
         assert!(validate_setting(Some("line\nbreak"), "测试值").is_err());
         assert_eq!(validate_setting(Some("valid value"), "测试值").unwrap(), "valid value");
+    }
+
+    #[test]
+    fn go_release_parser_selects_latest_windows_archive() {
+        let index = json!([
+            {
+                "version": "go1.25.2",
+                "stable": true,
+                "files": [{"filename": "go1.25.2.windows-amd64.zip", "os": "windows", "arch": "amd64", "kind": "archive", "sha256": "old"}]
+            },
+            {
+                "version": "go1.25.10",
+                "stable": true,
+                "files": [{"filename": "go1.25.10.windows-amd64.zip", "os": "windows", "arch": "amd64", "kind": "archive", "sha256": "new"}]
+            },
+            {
+                "version": "go1.26rc1",
+                "stable": false,
+                "files": [{"filename": "go1.26rc1.windows-amd64.zip", "os": "windows", "arch": "amd64", "kind": "archive", "sha256": "rc"}]
+            }
+        ]);
+        let release = parse_go_release_index(&index, "1.25").unwrap();
+        assert_eq!(release.tag, "go1.25.10");
+        assert_eq!(release.sha256.as_deref(), Some("new"));
+        assert!(release.url.ends_with("go1.25.10.windows-amd64.zip"));
+    }
+
+    #[test]
+    fn mirror_templates_include_only_selected_source() {
+        let maven = maven_settings_content(Some(("aliyun", "https://maven.aliyun.com/repository/public")));
+        assert!(maven.contains("<id>aliyun</id>"));
+        assert!(maven.contains("<mirrorOf>*</mirrorOf>"));
+        let gradle = gradle_init_content(Some("https://maven.aliyun.com/repository/public"));
+        assert!(gradle.contains("mavenCentral()"));
+        assert!(gradle.contains("maven.aliyun.com"));
+    }
+
+    #[test]
+    fn old_installed_data_deserializes_without_go_fields() {
+        let installed: InstalledData = serde_json::from_value(json!({
+            "jdks": [], "pythons": [], "nodes": [], "mavens": [], "gradles": [], "current": {}
+        }))
+        .unwrap();
+        assert!(installed.gos.is_empty());
+        assert!(installed.current.go.is_none());
     }
 }

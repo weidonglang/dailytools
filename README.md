@@ -34,6 +34,10 @@
 - Node.js 生态：检测 npm、npx、pnpm、Yarn、Corepack、registry、全局目录和 pnpm store，支持安装包管理器及切换官方源/npmmirror。
 - Python 生态：检测 pip、uv、Poetry、virtualenv 和 pip 配置，支持安装工具及切换官方/国内 PyPI 镜像。
 - 统一工具注册表：为 JDK、Python、Node.js、Maven、Gradle、Git、Go、Rust、.NET 和生态工具提供统一能力元数据。
+- Go 管理：从 `go.dev` 官方索引解析稳定版，校验 SHA256 后安装、切换和卸载 Windows x64 ZIP。
+- Rust / rustup 诊断：检测 rustup、rustc、Cargo、已安装工具链、默认工具链和 MSVC Build Tools，支持切换 stable 与更新。
+- .NET SDK 诊断：检测 SDK/Runtime 列表，识别项目 `global.json`，支持 restore、build 和 test 项目动作。
+- 镜像加速中心：集中查看 npm、pip、GOPROXY、Maven、Gradle 和 Cargo 配置，Maven/Gradle 写入前自动备份并可恢复。
 - 端口管理：扫描 TCP/UDP、固定列宽排序、常用端口筛选、智能搜索、安全结束普通进程。
 - 网络诊断、下载缓存管理、命令面板、自身卸载入口。
 - 后台执行耗时任务，隐藏 Windows 命令窗口，减少闪屏和界面卡顿。
@@ -49,6 +53,7 @@
 7. 在“项目启动向导”输入项目目录，分析项目并运行安装依赖、测试或开发服务。
 8. 在“端口”搜索 `8080`、`spring`、`mysql`、`vite` 等关键词快速定位冲突。
 9. 在“工具链”检查 Git/GitHub、Node 和 Python 生态，需要时配置 Git 身份、包管理器或镜像源。
+10. 在“平台/镜像”安装 Go、检查 Rust/.NET，或管理 GOPROXY、Maven 和 Gradle 镜像。
 
 ## 开发运行
 
@@ -67,8 +72,8 @@ npm run tauri:build
 
 输出位置：
 
-- `tauri\src-tauri\target\release\bundle\nsis\DevEnv Manager_0.2.0_x64-setup.exe`
-- `tauri\src-tauri\target\release\bundle\msi\DevEnv Manager_0.2.0_x64_en-US.msi`
+- `tauri\src-tauri\target\release\bundle\nsis\DevEnv Manager_0.3.0_x64-setup.exe`
+- `tauri\src-tauri\target\release\bundle\msi\DevEnv Manager_0.3.0_x64_en-US.msi`
 - `tauri\src-tauri\target\release\dailytools-tauri.exe`
 
 ## 测试
@@ -92,6 +97,8 @@ npm run build
 - 导出诊断报告会脱敏用户目录和常见敏感键值，不导出私钥、token、密码。
 - SSH Key 生成发现同名密钥时会拒绝覆盖，界面只允许复制公钥，绝不读取或显示私钥。
 - npm 和 pip 镜像只能从内置白名单选择，工具安装包名使用固定白名单，避免拼接任意命令。
+- Go 只从 `go.dev` 白名单下载，并使用官方索引提供的 SHA256 校验安装包。
+- Maven/Gradle 只写用户目录中的固定配置文件；已有文件会先生成时间戳备份，界面提供最近备份恢复入口。
 - 不包含账号系统、云同步、遥测、广告或联网统计。
 
 ## 常见问题
@@ -133,6 +140,11 @@ Maven 和 Gradle 需要有效 JDK。新版会在受管命令执行时注入 `JAV
 - 配置测试用 Git 身份，确认刷新后立即显示；已有 `id_ed25519` 时确认不会覆盖。
 - 检查 npm/pnpm/Yarn/Corepack，切换 npm 官方源与 npmmirror 后验证。
 - 检查 pip/uv/Poetry/virtualenv，切换 PyPI 镜像并安装一个缺失工具后验证。
+- 安装并切换 Go 1.25/1.26，验证 `go version` 与 `go env`。
+- 切换 GOPROXY 后重新检查，确认只修改当前用户环境变量。
+- 检查 rustup、Rust 工具链和 MSVC Build Tools，执行 stable 切换。
+- 检查 .NET SDK/Runtime，并用含 `global.json` 的项目验证版本匹配提示。
+- 写入 Maven/Gradle 测试镜像，确认先生成备份，再测试最近备份恢复。
 - 打包 Tauri 安装包。
 
 ## 路线图
@@ -149,11 +161,13 @@ Maven 和 Gradle 需要有效 JDK。新版会在受管命令执行时注入 `JAV
 - Node.js 包管理器检测、安装、registry 和全局目录管理
 - Python 工具链检测、安装和 pip 镜像管理
 - 统一工具元数据注册表
+- Go 受管安装、切换、卸载和代理管理
+- Rust/rustup 与 MSVC Build Tools 诊断
+- .NET SDK/Runtime 与 `global.json` 诊断
+- Maven/Gradle 镜像配置备份和恢复
 
 后续规划：
 
-- Go、Rust、.NET SDK 更完整的检测、安装引导和项目动作。
-- 镜像源与网络加速中心。
 - Docker / WSL 检测。
 - 数据库和本地服务端口解释器。
 - 配置模板导入、导出和团队模板。

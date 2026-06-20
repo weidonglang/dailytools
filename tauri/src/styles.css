@@ -695,6 +695,34 @@ select {
   margin-top: 0;
 }
 
+.platform-section,
+.platform-content {
+  display: grid;
+  gap: 14px;
+}
+
+.platform-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.platform-columns h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.mirror-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.mirror-actions .form-row {
+  grid-template-columns: minmax(160px, 1fr) auto auto;
+}
+
 .suggestion,
 .doctor-check {
   display: grid;
@@ -851,5 +879,9 @@ select {
 
   .tool-state-grid {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .mirror-actions {
+    grid-template-columns: 1fr;
   }
 }

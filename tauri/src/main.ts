@@ -4,6 +4,7 @@ import {
   Activity,
   Boxes,
   Clipboard,
+  Cpu,
   Download,
   FileText,
   FolderSearch,
@@ -50,6 +51,7 @@ type ConfigView = {
     nodes: ManagedRuntime[];
     mavens: ManagedRuntime[];
     gradles: ManagedRuntime[];
+    gos: ManagedRuntime[];
     current: Record<string, string | null>;
   };
   paths: {
@@ -256,6 +258,40 @@ type ToolchainReport = {
   generatedAt: string;
 };
 
+type PlatformReport = {
+  go: {
+    go: ToolState;
+    goroot: string;
+    gopath: string;
+    goproxy: string;
+    gomodcache: string;
+  };
+  rust: {
+    tools: ToolState[];
+    defaultToolchain: string;
+    installedToolchains: string[];
+    msvcBuildTools: string;
+    cargoConfigPath: string;
+  };
+  dotnet: {
+    dotnet: ToolState;
+    sdks: string[];
+    runtimes: string[];
+  };
+  mirrors: {
+    npmRegistry: string;
+    pipIndexUrl: string;
+    goProxy: string;
+    mavenSettingsPath: string;
+    mavenSettingsExists: boolean;
+    gradleInitPath: string;
+    gradleInitExists: boolean;
+    cargoConfigPath: string;
+    cargoConfigExists: boolean;
+  };
+  generatedAt: string;
+};
+
 const app = document.querySelector<HTMLDivElement>("#app");
 
 if (!app) {
@@ -280,6 +316,7 @@ app.innerHTML = `
         <button class="nav-item" data-view="environment">${icon(Route)}<span>环境</span></button>
         <button class="nav-item" data-view="project">${icon(FolderSearch)}<span>项目</span></button>
         <button class="nav-item" data-view="toolchains">${icon(PackageCheck)}<span>工具链</span></button>
+        <button class="nav-item" data-view="platforms">${icon(Cpu)}<span>平台/镜像</span></button>
         <button class="nav-item" data-view="toolbox">${icon(Hammer)}<span>工具箱</span></button>
       </nav>
     </aside>
@@ -569,6 +606,87 @@ app.innerHTML = `
         </div>
       </section>
 
+      <section id="view-platforms" class="view">
+        <section class="panel">
+          <div class="panel-head">
+            <div class="panel-title">${icon(Cpu)}<h2>平台工具链</h2></div>
+            <button id="inspect-platforms" class="primary">${icon(RefreshCw)}<span>全面检查</span></button>
+          </div>
+        </section>
+
+        <section class="panel platform-section">
+          <div class="panel-head">
+            <div class="panel-title">${icon(Download)}<h2>Go 管理</h2></div>
+            <div class="toolbar compact">
+              <select id="go-version">
+                <option value="1.22">Go 1.22</option>
+                <option value="1.23">Go 1.23</option>
+                <option value="1.24">Go 1.24</option>
+                <option value="1.25">Go 1.25</option>
+                <option value="1.26" selected>Go 1.26</option>
+              </select>
+              <button id="install-go">${icon(Download)}<span>安装</span></button>
+            </div>
+          </div>
+          <div id="managed-gos" class="runtime-list"></div>
+          <div id="go-platform" class="platform-content"><div class="empty">尚未检查 Go 环境</div></div>
+          <div class="form-row">
+            <select id="go-proxy">
+              <option value="official">Go 官方代理</option>
+              <option value="goproxy_cn">goproxy.cn</option>
+              <option value="direct">仅 direct</option>
+            </select>
+            <button id="set-go-proxy">切换 GOPROXY</button>
+          </div>
+        </section>
+
+        <div class="grid two">
+          <section class="panel platform-section">
+            <div class="panel-title">${icon(Cpu)}<h2>Rust / rustup</h2></div>
+            <div id="rust-platform" class="platform-content"><div class="empty">尚未检查 Rust 环境</div></div>
+            <div class="toolbar">
+              <button id="rust-stable">切换 stable</button>
+              <button id="rust-update">更新工具链</button>
+              <button data-action="copy-text" data-copy="https://rustup.rs/">${icon(Clipboard)}<span>复制 rustup 地址</span></button>
+              <button id="copy-cargo-mirror">${icon(Clipboard)}<span>复制 Cargo 镜像配置</span></button>
+            </div>
+          </section>
+
+          <section class="panel platform-section">
+            <div class="panel-title">${icon(Cpu)}<h2>.NET SDK</h2></div>
+            <div id="dotnet-platform" class="platform-content"><div class="empty">尚未检查 .NET SDK</div></div>
+            <div class="toolbar">
+              <button data-action="copy-text" data-copy="https://dotnet.microsoft.com/download">${icon(Clipboard)}<span>复制下载地址</span></button>
+              <button data-action="copy-text" data-copy="dotnet --list-sdks; dotnet --list-runtimes">${icon(Clipboard)}<span>复制检查命令</span></button>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel platform-section">
+          <div class="panel-title">${icon(Network)}<h2>镜像加速中心</h2></div>
+          <div id="mirror-platform" class="platform-content"><div class="empty">尚未读取镜像配置</div></div>
+          <div class="mirror-actions">
+            <div class="form-row">
+              <select id="maven-mirror">
+                <option value="official">Maven 官方源</option>
+                <option value="aliyun">阿里云 Maven 镜像</option>
+              </select>
+              <button id="set-maven-mirror">写入 Maven 配置</button>
+              <button id="restore-maven-config" title="恢复最近的 DevEnv Manager 备份">${icon(RefreshCw)}</button>
+            </div>
+            <div class="form-row">
+              <select id="gradle-mirror">
+                <option value="official">Gradle 默认源</option>
+                <option value="aliyun">阿里云 Maven 镜像</option>
+              </select>
+              <button id="set-gradle-mirror">写入 Gradle 配置</button>
+              <button id="restore-gradle-config" title="恢复最近的 DevEnv Manager 备份">${icon(RefreshCw)}</button>
+            </div>
+            <button id="open-package-mirrors">管理 npm / pip 源</button>
+          </div>
+        </section>
+      </section>
+
       <section id="view-toolbox" class="view">
         <div class="grid two">
           <section class="panel">
@@ -639,6 +757,7 @@ const state = {
   python: null as PythonAnalysis | null,
   project: null as ProjectAnalysis | null,
   toolchains: null as ToolchainReport | null,
+  platforms: null as PlatformReport | null,
 };
 
 const portState = {
@@ -771,6 +890,7 @@ function renderRuntimes() {
   renderManagedNodes();
   renderManagedPythons();
   renderManagedBuildTools();
+  renderManagedGos();
 }
 
 function renderManagedJdks() {
@@ -880,6 +1000,32 @@ function renderManagedBuildTools() {
     : `<div class="empty">还没有安装受管 Maven 或 Gradle</div>`;
 }
 
+function renderManagedGos() {
+  const element = document.querySelector<HTMLElement>("#managed-gos");
+  if (!element) return;
+  const gos = state.config?.installed.gos || [];
+  const current = state.config?.installed.current.go;
+  element.innerHTML = gos.length
+    ? gos
+        .map(
+          (go) => `
+            <article class="runtime managed-runtime">
+              <div>
+                <strong>Go ${escapeHtml(go.version)}${current === go.version ? " · 当前" : ""}</strong>
+                <span>${escapeHtml(go.detail || "")}</span>
+              </div>
+              <small>${escapeHtml(go.path)}</small>
+              <div class="row-actions">
+                <button data-action="switch-go" data-version="${escapeHtml(go.version)}" data-path="${escapeHtml(go.path)}">${icon(RefreshCw)}<span>切换</span></button>
+                <button data-action="uninstall-go" data-version="${escapeHtml(go.version)}" data-path="${escapeHtml(go.path)}">${icon(Trash2)}<span>卸载</span></button>
+              </div>
+            </article>
+          `,
+        )
+        .join("")
+    : `<div class="empty">还没有安装受管 Go</div>`;
+}
+
 function renderPorts() {
   const visible = sortedPorts(filteredPorts(state.ports));
   setText("metric-ports", visible.length);
@@ -912,7 +1058,7 @@ function canUninstallExternal(runtime: RuntimeInfo) {
   const source = runtime.source.toLowerCase();
   return (
     !source.includes("devenv") &&
-    ["Java", "Python", "Node.js", "Maven", "Gradle"].includes(runtime.kind)
+    ["Java", "Python", "Node.js", "Maven", "Gradle", "Go"].includes(runtime.kind)
   );
 }
 
@@ -1009,6 +1155,7 @@ function doctorActionLabel(action: string) {
     ports: "查看端口",
     cache: "查看缓存",
     toolchains: "查看工具链",
+    platforms: "查看平台",
     copy_fix_command: "复制建议",
   };
   return labels[action] || "处理";
@@ -1147,6 +1294,73 @@ async function runToolchainAction(action: string, value: string | null = null, s
     const result = await invoke<OperationResult>("run_toolchain_action", { action, value, secondary });
     showToast(result.message);
     await inspectToolchains("正在验证操作结果");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+function renderPlatforms() {
+  const go = document.querySelector<HTMLElement>("#go-platform");
+  const rust = document.querySelector<HTMLElement>("#rust-platform");
+  const dotnet = document.querySelector<HTMLElement>("#dotnet-platform");
+  const mirrors = document.querySelector<HTMLElement>("#mirror-platform");
+  const report = state.platforms;
+  if (!go || !rust || !dotnet || !mirrors || !report) return;
+
+  go.innerHTML = `
+    <div class="tool-state-grid">${renderToolStates([report.go.go])}</div>
+    <div class="kv-list toolchain-kv">
+      <div><span>GOROOT</span><strong>${escapeHtml(report.go.goroot || "未读取")}</strong></div>
+      <div><span>GOPATH</span><strong>${escapeHtml(report.go.gopath || "未读取")}</strong></div>
+      <div><span>GOPROXY</span><strong>${escapeHtml(report.go.goproxy || "未读取")}</strong></div>
+      <div><span>GOMODCACHE</span><strong>${escapeHtml(report.go.gomodcache || "未读取")}</strong></div>
+    </div>
+  `;
+  rust.innerHTML = `
+    <div class="tool-state-grid">${renderToolStates(report.rust.tools)}</div>
+    <div class="kv-list toolchain-kv">
+      <div><span>默认工具链</span><strong>${escapeHtml(report.rust.defaultToolchain || "未设置")}</strong></div>
+      <div><span>MSVC Build Tools</span><strong>${escapeHtml(report.rust.msvcBuildTools)}</strong></div>
+      <div><span>Cargo 配置</span><strong>${escapeHtml(report.rust.cargoConfigPath)}</strong></div>
+    </div>
+    <div class="chip-row">${report.rust.installedToolchains.map((item) => `<span>${escapeHtml(item)}</span>`).join("") || ""}</div>
+  `;
+  dotnet.innerHTML = `
+    <div class="tool-state-grid">${renderToolStates([report.dotnet.dotnet])}</div>
+    <div class="platform-columns">
+      <div><h3>SDK</h3><pre class="command-output compact-output">${escapeHtml(report.dotnet.sdks.join("\n") || "未发现 SDK")}</pre></div>
+      <div><h3>Runtime</h3><pre class="command-output compact-output">${escapeHtml(report.dotnet.runtimes.join("\n") || "未发现 Runtime")}</pre></div>
+    </div>
+  `;
+  mirrors.innerHTML = `
+    <div class="kv-list toolchain-kv">
+      <div><span>npm registry</span><strong>${escapeHtml(report.mirrors.npmRegistry || "未读取")}</strong></div>
+      <div><span>pip index-url</span><strong>${escapeHtml(report.mirrors.pipIndexUrl)}</strong></div>
+      <div><span>GOPROXY</span><strong>${escapeHtml(report.mirrors.goProxy || "未读取")}</strong></div>
+      <div><span>Maven settings.xml</span><strong>${escapeHtml(report.mirrors.mavenSettingsPath)} · ${report.mirrors.mavenSettingsExists ? "已存在" : "未创建"}</strong></div>
+      <div><span>Gradle init.gradle</span><strong>${escapeHtml(report.mirrors.gradleInitPath)} · ${report.mirrors.gradleInitExists ? "已存在" : "未创建"}</strong></div>
+      <div><span>Cargo config.toml</span><strong>${escapeHtml(report.mirrors.cargoConfigPath)} · ${report.mirrors.cargoConfigExists ? "已存在" : "未创建"}</strong></div>
+    </div>
+  `;
+}
+
+async function inspectPlatforms(message = "正在检查平台工具链") {
+  showToast(message);
+  try {
+    state.platforms = await invoke<PlatformReport>("inspect_platform_toolchains");
+    renderPlatforms();
+    showToast("平台工具链检查完成");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function runPlatformAction(action: string, value: string | null = null) {
+  showToast("正在执行平台工具链操作");
+  try {
+    const result = await invoke<OperationResult>("run_platform_action", { action, value });
+    showToast(result.message);
+    await inspectPlatforms("正在验证操作结果");
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error), true);
   }
@@ -1436,6 +1650,11 @@ async function runDoctorAction(action: string) {
     await inspectToolchains();
     return;
   }
+  if (action === "platforms") {
+    activateView("platforms");
+    await inspectPlatforms();
+    return;
+  }
   if (action === "copy_fix_command") {
     await copyText("devenv doctor");
     return;
@@ -1599,6 +1818,15 @@ document.querySelector("#install-node")?.addEventListener("click", () => {
     "Node.js",
   );
 });
+document.querySelector("#install-go")?.addEventListener("click", () => {
+  const select = document.querySelector<HTMLSelectElement>("#go-version");
+  if (!select) return;
+  void runRuntimeOperation(
+    () => invoke<OperationResult>("install_go", { version: select.value }),
+    `正在安装 Go ${select.value}`,
+    "Go",
+  );
+});
 document.querySelector("#install-python")?.addEventListener("click", () => {
   const select = document.querySelector<HTMLSelectElement>("#python-version");
   if (!select) return;
@@ -1625,6 +1853,45 @@ document.querySelector("#analyze-python")?.addEventListener("click", async () =>
   }
 });
 document.querySelector("#inspect-toolchains")?.addEventListener("click", () => void inspectToolchains());
+document.querySelector("#inspect-platforms")?.addEventListener("click", () => void inspectPlatforms());
+document.querySelector("#set-go-proxy")?.addEventListener("click", () => {
+  const value = document.querySelector<HTMLSelectElement>("#go-proxy")?.value || "official";
+  void runPlatformAction("go_proxy", value);
+});
+document.querySelector("#rust-stable")?.addEventListener("click", () => {
+  void runPlatformAction("rust_default_stable");
+});
+document.querySelector("#rust-update")?.addEventListener("click", () => {
+  if (!window.confirm("rustup 将联网更新当前用户安装的 Rust 工具链，可能需要一些时间。确定继续吗？")) return;
+  void runPlatformAction("rust_update");
+});
+document.querySelector("#copy-cargo-mirror")?.addEventListener("click", () => {
+  void copyText(`[source.crates-io]\nreplace-with = "rsproxy-sparse"\n\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"`);
+});
+document.querySelector("#set-maven-mirror")?.addEventListener("click", () => {
+  const value = document.querySelector<HTMLSelectElement>("#maven-mirror")?.value || "official";
+  const path = state.platforms?.mirrors.mavenSettingsPath || "%USERPROFILE%\\.m2\\settings.xml";
+  if (!window.confirm(`将写入 ${path}。若文件已存在，会先创建带时间戳的备份。确定继续吗？`)) return;
+  void runPlatformAction("maven_mirror", value);
+});
+document.querySelector("#set-gradle-mirror")?.addEventListener("click", () => {
+  const value = document.querySelector<HTMLSelectElement>("#gradle-mirror")?.value || "official";
+  const path = state.platforms?.mirrors.gradleInitPath || "%USERPROFILE%\\.gradle\\init.gradle";
+  if (!window.confirm(`将写入 ${path}。若文件已存在，会先创建带时间戳的备份。确定继续吗？`)) return;
+  void runPlatformAction("gradle_mirror", value);
+});
+document.querySelector("#restore-maven-config")?.addEventListener("click", () => {
+  if (!window.confirm("将恢复最近一次 DevEnv Manager 备份的 Maven 配置，并保留当前配置备份。确定继续吗？")) return;
+  void runPlatformAction("restore_maven_config");
+});
+document.querySelector("#restore-gradle-config")?.addEventListener("click", () => {
+  if (!window.confirm("将恢复最近一次 DevEnv Manager 备份的 Gradle 配置，并保留当前配置备份。确定继续吗？")) return;
+  void runPlatformAction("restore_gradle_config");
+});
+document.querySelector("#open-package-mirrors")?.addEventListener("click", () => {
+  activateView("toolchains");
+  if (!state.toolchains) void inspectToolchains();
+});
 document.querySelector("#save-git-identity")?.addEventListener("click", () => {
   const name = document.querySelector<HTMLInputElement>("#git-user-name")?.value.trim() || "";
   const email = document.querySelector<HTMLInputElement>("#git-user-email")?.value.trim() || "";
@@ -1852,6 +2119,23 @@ document.addEventListener("click", (event) => {
     void runOperation(
       () => invoke<OperationResult>("uninstall_runtime", { kind: "node", version, path }),
       `正在卸载 Node.js ${version}`,
+    );
+  }
+  if (action === "switch-go") {
+    const version = button.dataset.version || "";
+    const path = button.dataset.path || null;
+    void runRuntimeOperation(
+      () => invoke<OperationResult>("switch_runtime", { kind: "go", version, path }),
+      `正在切换 Go ${version}`,
+      "Go",
+    );
+  }
+  if (action === "uninstall-go") {
+    const version = button.dataset.version || "";
+    const path = button.dataset.path || null;
+    void runOperation(
+      () => invoke<OperationResult>("uninstall_runtime", { kind: "go", version, path }),
+      `正在卸载 Go ${version}`,
     );
   }
   if (action === "switch-python") {
