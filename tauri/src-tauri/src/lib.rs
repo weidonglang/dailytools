@@ -1,4 +1,5 @@
 mod cleanup;
+mod diagnostics;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -226,6 +227,23 @@ struct RuntimeInfo {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct JavaEnvironmentReport {
+    java_home: String,
+    java_home_expanded: String,
+    path_java: String,
+    path_javac: String,
+    java_version: String,
+    javac_version: String,
+    maven_runtime: String,
+    gradle_runtime: String,
+    effective_source: String,
+    consistent: bool,
+    warnings: Vec<String>,
+    candidates: Vec<RuntimeInfo>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PortRecord {
     protocol: String,
     local_address: String,
@@ -316,6 +334,17 @@ struct CommandRunResult {
     return_code: i32,
     output: String,
     elapsed_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandSafetyAssessment {
+    allowed: bool,
+    risk: String,
+    reason: String,
+    requires_confirmation: bool,
+    elevated: bool,
+    executable: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -613,6 +642,7 @@ struct UpdateCheckResult {
     notes: Vec<String>,
     download_url: String,
     sha256: String,
+    checked_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -736,12 +766,46 @@ async fn scan_storage_cleanup() -> Result<cleanup::CleanupScanReport, String> {
 }
 
 #[tauri::command]
-async fn clean_storage_items(ids: Vec<String>) -> Result<cleanup::CleanupRunResult, String> {
+async fn inspect_java_environment() -> Result<JavaEnvironmentReport, String> {
+    run_blocking(inspect_java_environment_blocking).await?
+}
+
+#[tauri::command]
+async fn inspect_agent_traces(
+    project_path: Option<String>,
+) -> Result<diagnostics::AgentTraceReport, String> {
     run_blocking(move || {
+        let project = project_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        diagnostics::inspect_agent_traces(project.as_deref())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn scan_cleanup_targets() -> Result<cleanup::CleanupScanReport, String> {
+    run_blocking(|| {
         let paths = load_paths()?;
-        cleanup::clean(&paths.root, &app_config_dir(), &ids)
+        cleanup::scan_cleanup_targets(&paths.root)
     })
     .await?
+}
+
+#[tauri::command]
+async fn inspect_maintenance_overview() -> Result<cleanup::MaintenanceOverview, String> {
+    run_blocking(|| {
+        let paths = load_paths()?;
+        cleanup::inspect_maintenance_overview(&paths.root)
+    })
+    .await?
+}
+
+#[tauri::command]
+async fn inspect_disk_overview() -> Result<Vec<cleanup::DiskVolumeInfo>, String> {
+    run_blocking(cleanup::inspect_disk_overview).await?
 }
 
 #[tauri::command]
@@ -793,7 +857,7 @@ async fn check_for_updates() -> Result<UpdateCheckResult, String> {
 fn check_for_updates_blocking() -> Result<UpdateCheckResult, String> {
     let settings = load_settings()?;
     let url = if settings.update_manifest_url.trim().is_empty() {
-        "https://raw.githubusercontent.com/weidonglang/dailytools/main/update-manifest.json"
+        "https://raw.githubusercontent.com/weidonglang/DevEnv-Manager/main/update-manifest.json"
             .to_string()
     } else {
         settings.update_manifest_url
@@ -822,6 +886,7 @@ fn check_for_updates_blocking() -> Result<UpdateCheckResult, String> {
         notes: manifest.notes,
         download_url: manifest.download_url,
         sha256: manifest.sha256,
+        checked_at: current_timestamp(),
     })
 }
 
@@ -1517,11 +1582,59 @@ fn switch_runtime_blocking(
     if !target.exists() {
         return Err(format!("版本目录不存在：{}", display_path(&target)));
     }
+    let previous_current = installed.current.clone();
+    let previous_environment = (meta.kind == "jdk")
+        .then(user_environment)
+        .transpose()?
+        .unwrap_or_default();
+    if meta.kind == "jdk" {
+        save_json(
+            &paths.env_backup_file(),
+            &json!({
+                "created_at": current_timestamp(),
+                "reason": format!("切换 JDK 到 {selected_version} 前的快照"),
+                "DEVENV_HOME": previous_environment.get("DEVENV_HOME"),
+                "JAVA_HOME": previous_environment.get("JAVA_HOME"),
+                "Path": previous_environment.get("Path").or_else(|| previous_environment.get("PATH")),
+            }),
+        )?;
+    }
     switch_junction(&paths.current().join(meta.link_name), &target, &paths.root)?;
     set_current(&mut installed, meta.kind, Some(selected_version.clone()));
     save_json(&paths.installed_file(), &installed)?;
     if meta.kind == "jdk" {
-        refresh_user_java_home(&paths)?;
+        if let Err(error) = refresh_user_java_home(&paths) {
+            if let Some(previous_version) = previous_current.jdk.as_deref() {
+                if let Some(previous_record) = installed.jdks.iter().find(|item| {
+                    item.get("version").and_then(Value::as_str) == Some(previous_version)
+                }) {
+                    if let Some(previous_path) = previous_record.get("path").and_then(Value::as_str)
+                    {
+                        let _ = switch_junction(
+                            &paths.current().join(meta.link_name),
+                            Path::new(previous_path),
+                            &paths.root,
+                        );
+                    }
+                }
+            } else {
+                let _ = remove_junction(&paths.current().join(meta.link_name));
+            }
+            installed.current = previous_current;
+            let _ = save_json(&paths.installed_file(), &installed);
+            let previous_path = previous_environment
+                .get("Path")
+                .or_else(|| previous_environment.get("PATH"))
+                .cloned()
+                .unwrap_or_default();
+            let _ = restore_environment_values(
+                previous_environment.get("DEVENV_HOME").map(String::as_str),
+                previous_environment.get("JAVA_HOME").map(String::as_str),
+                &previous_path,
+            );
+            broadcast_environment_change();
+            return Err(format!("JDK 切换验证失败，已恢复上一个环境：{error}"));
+        }
     }
     Ok(OperationResult {
         success: true,
@@ -2246,8 +2359,164 @@ fn clear_download_cache() -> Result<OperationResult, String> {
 async fn run_tool_command(
     command: String,
     cwd: Option<String>,
+    confirmed: Option<bool>,
 ) -> Result<CommandRunResult, String> {
-    run_blocking(move || run_tool_command_blocking(command, cwd)).await?
+    run_blocking(move || {
+        let assessment = assess_command_safety(&command)?;
+        if !assessment.allowed {
+            return Err(format!("命令已被安全模式拦截：{}", assessment.reason));
+        }
+        if assessment.requires_confirmation && confirmed != Some(true) {
+            return Err(format!("该命令需要确认：{}", assessment.reason));
+        }
+        run_tool_command_blocking(command, cwd)
+    })
+    .await?
+}
+
+#[tauri::command]
+fn inspect_command_safety(command: String) -> Result<CommandSafetyAssessment, String> {
+    assess_command_safety(&command)
+}
+
+fn is_process_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        hidden_command("whoami")
+            .args(["/groups", "/fo", "csv", "/nh"])
+            .output()
+            .ok()
+            .map(|output| command_text(&output.stdout, &output.stderr))
+            .is_some_and(|text| {
+                text.contains("S-1-16-12288")
+                    || text.contains("S-1-16-16384")
+                    || text.contains("S-1-5-32-544") && text.contains("Enabled group")
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn assess_command_safety(command: &str) -> Result<CommandSafetyAssessment, String> {
+    let parts = parse_command_line(command)?;
+    let executable = parts
+        .first()
+        .ok_or_else(|| "命令不能为空".to_string())?
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    let name = Path::new(&executable)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(&executable)
+        .trim_end_matches(".exe")
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".bat")
+        .to_string();
+    let elevated = is_process_elevated();
+    let blocked = [
+        "cmd",
+        "powershell",
+        "pwsh",
+        "reg",
+        "regedit",
+        "diskpart",
+        "format",
+        "bcdedit",
+        "takeown",
+        "icacls",
+        "shutdown",
+        "taskkill",
+        "sc",
+        "net",
+        "netsh",
+        "wmic",
+        "cipher",
+    ];
+    if blocked.contains(&name.as_str()) {
+        return Ok(CommandSafetyAssessment {
+            allowed: false,
+            risk: "blocked".to_string(),
+            reason: "系统 Shell、磁盘、注册表、权限或服务管理命令不允许从命令面板运行".to_string(),
+            requires_confirmation: false,
+            elevated,
+            executable: name,
+        });
+    }
+    let allowed = [
+        "node", "npm", "npx", "pnpm", "yarn", "corepack", "python", "py", "pip", "uv", "poetry",
+        "java", "javac", "mvn", "mvnw", "gradle", "gradlew", "git", "go", "rustc", "cargo",
+        "rustup", "dotnet", "devenv",
+    ];
+    if !allowed.contains(&name.as_str()) {
+        return Ok(CommandSafetyAssessment {
+            allowed: false,
+            risk: "blocked".to_string(),
+            reason: format!("{name} 不在开发工具白名单中"),
+            requires_confirmation: false,
+            elevated,
+            executable: name,
+        });
+    }
+    let lower = parts
+        .iter()
+        .skip(1)
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let destructive_git = name == "git"
+        && (lower.windows(2).any(|pair| pair == ["reset", "--hard"])
+            || lower.iter().any(|arg| arg == "clean")
+            || lower.windows(2).any(|pair| pair == ["branch", "-d"]));
+    if destructive_git {
+        return Ok(CommandSafetyAssessment {
+            allowed: false,
+            risk: "blocked".to_string(),
+            reason: "破坏工作区或删除分支的 Git 命令已被拦截，请在受控终端中自行确认".to_string(),
+            requires_confirmation: false,
+            elevated,
+            executable: name,
+        });
+    }
+    let inline_code = matches!(name.as_str(), "python" | "py")
+        && lower.iter().any(|arg| arg == "-c")
+        || name == "node" && lower.iter().any(|arg| arg == "-e" || arg == "--eval");
+    if inline_code {
+        return Ok(CommandSafetyAssessment {
+            allowed: false,
+            risk: "blocked".to_string(),
+            reason: "命令面板禁止解释器内联代码（python -c / node -e），避免把未知文本直接执行"
+                .to_string(),
+            requires_confirmation: false,
+            elevated,
+            executable: name,
+        });
+    }
+    let changes_state = lower.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "install" | "uninstall" | "update" | "upgrade" | "add" | "remove" | "publish" | "push"
+        )
+    });
+    Ok(CommandSafetyAssessment {
+        allowed: true,
+        risk: if elevated || changes_state {
+            "caution"
+        } else {
+            "low"
+        }
+        .to_string(),
+        reason: if elevated {
+            "程序当前可能处于管理员权限，命令影响范围更大".to_string()
+        } else if changes_state {
+            "命令可能安装、更新或发布内容，请确认来源和影响范围".to_string()
+        } else {
+            "命令属于常见开发工具白名单".to_string()
+        },
+        requires_confirmation: elevated || changes_state,
+        elevated,
+        executable: name,
+    })
 }
 
 fn run_tool_command_blocking(
@@ -2259,6 +2528,9 @@ fn run_tool_command_blocking(
     let started = Instant::now();
     let mut cmd = hidden_command(executable);
     cmd.args(parts.iter().skip(1));
+    if let Ok(paths) = load_paths() {
+        apply_managed_environment(&paths, &mut cmd);
+    }
     if let Some(cwd) = cwd.filter(|item| !item.trim().is_empty()) {
         cmd.current_dir(cwd);
     }
@@ -2329,6 +2601,18 @@ fn environment_health_blocking() -> Result<Vec<EnvHealthCheck>, String> {
             name: "JAVA_HOME".to_string(),
             status: "未设置".to_string(),
             detail: "未发现 JAVA_HOME；安装或切换 JDK 后会自动配置".to_string(),
+        });
+    }
+
+    if let Ok(java) = inspect_java_environment_blocking() {
+        checks.push(EnvHealthCheck {
+            name: "JDK 生效链".to_string(),
+            status: if java.consistent { "正常" } else { "异常" }.to_string(),
+            detail: if java.consistent {
+                format!("{} · {}", java.java_version, java.effective_source)
+            } else {
+                java.warnings.join("；")
+            },
         });
     }
 
@@ -2786,9 +3070,7 @@ fn run_doctor_blocking() -> Result<DoctorReport, String> {
     let final_score = score.clamp(0, 100) as u8;
     let problem_count = checks
         .iter()
-        .filter(|item| {
-            item.severity != "info" || !matches!(item.status.as_str(), "正常" | "可选缺失")
-        })
+        .filter(|item| doctor_check_needs_attention(item))
         .count();
     Ok(DoctorReport {
         score: final_score,
@@ -4222,6 +4504,34 @@ fn analyze_project_blocking(root: &Path) -> Result<ProjectAnalysis, String> {
             true,
         ));
     }
+    if has("bin/startup.cmd") && has("conf/application.properties") {
+        push_unique(&mut project_types, "Nacos");
+        let java = inspect_java_environment_blocking().ok();
+        recommendations.push(ProjectRuntimeRecommendation {
+            name: "Nacos Java".to_string(),
+            requirement: "需要完整 JDK 8 或更高版本，并保证 JAVA_HOME 与 PATH 一致".to_string(),
+            status: java
+                .as_ref()
+                .map(|report| {
+                    if report.consistent && !report.path_javac.is_empty() {
+                        format!("已验证：{}", report.java_version)
+                    } else {
+                        "JAVA_HOME/PATH 需要修复".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "未能读取 Java 环境".to_string()),
+        });
+        actions.push(project_action(
+            "nacos_start",
+            "启动 Nacos 单机模式",
+            "bin\\startup.cmd -m standalone",
+            "使用 DevEnv Manager 已验证的 JAVA_HOME 启动 Nacos",
+            true,
+        ));
+        if java.as_ref().is_some_and(|report| !report.consistent) {
+            warnings.push("Nacos 启动前请先修复 JAVA_HOME 与 PATH 的 JDK 不一致问题".to_string());
+        }
+    }
     actions.push(project_action(
         "vscode",
         "生成 VS Code 配置",
@@ -4293,16 +4603,42 @@ fn run_project_action_blocking(path: String, action: String) -> Result<CommandRu
             elapsed_ms: 0,
         });
     }
+    if action == "nacos_start" {
+        let paths = load_paths()?;
+        let started = Instant::now();
+        let mut command = hidden_command("cmd");
+        command
+            .args(["/d", "/c", "bin\\startup.cmd", "-m", "standalone"])
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        apply_managed_environment(&paths, &mut command);
+        command
+            .spawn()
+            .map_err(|err| format!("启动 Nacos 失败：{err}"))?;
+        return Ok(CommandRunResult {
+            success: true,
+            return_code: 0,
+            output: "已使用经过校验的 JAVA_HOME 后台启动 Nacos 单机模式".to_string(),
+            elapsed_ms: started.elapsed().as_millis(),
+        });
+    }
     if matches!(action.as_str(), "npm_dev" | "npm_tauri_dev") {
         let parts = parse_command_line(&selected.command)?;
         let executable = parts.first().ok_or_else(|| "命令为空".to_string())?;
         let started = Instant::now();
-        hidden_command(executable)
+        let mut command = hidden_command(executable);
+        command
             .args(parts.iter().skip(1))
             .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(paths) = load_paths() {
+            apply_managed_environment(&paths, &mut command);
+        }
+        command
             .spawn()
             .map_err(|err| format!("启动开发服务失败：{err}"))?;
         return Ok(CommandRunResult {
@@ -4351,7 +4687,7 @@ fn repair_doctor_safe_blocking() -> Result<DoctorRepairResult, String> {
     let remaining = report
         .checks
         .iter()
-        .filter(|item| item.status != "正常")
+        .filter(|item| doctor_check_needs_attention(item))
         .map(|item| format!("{}：{}", item.title, item.detail))
         .collect();
     Ok(DoctorRepairResult {
@@ -4940,7 +5276,9 @@ pub fn run() {
             app_snapshot,
             storage_cleanup_architecture,
             scan_storage_cleanup,
-            clean_storage_items,
+            scan_cleanup_targets,
+            inspect_maintenance_overview,
+            inspect_disk_overview,
             jdk_distributions,
             check_for_updates,
             download_update,
@@ -4949,6 +5287,8 @@ pub fn run() {
             set_root_dir,
             set_auto_check_update,
             env_snapshot,
+            inspect_java_environment,
+            inspect_agent_traces,
             configure_user_environment,
             cleanup_path_entries,
             restore_user_environment,
@@ -4991,6 +5331,7 @@ pub fn run() {
             network_diagnostics,
             cache_entries,
             clear_download_cache,
+            inspect_command_safety,
             run_tool_command,
             environment_health,
             list_config_profiles,
@@ -5096,10 +5437,9 @@ fn run_cli(args: Vec<String>) -> Result<String, String> {
                     .map_err(|err| format!("生成 JSON 失败：{err}"))
             } else {
                 Ok(format!(
-                    "发现 {} 个候选项，共 {}；默认建议选择 {}。\n实际清理请在桌面端逐项预览并确认。",
-                    report.candidates.len(),
-                    format_byte_size(report.total_size),
-                    format_byte_size(report.default_selected_size)
+                    "扫描到 {} 个统计项，共 {}。\nPhase 1 仅扫描，不会删除、移动或修改文件。",
+                    report.total_items,
+                    format_byte_size(report.total_bytes)
                 ))
             }
         }
@@ -5330,7 +5670,7 @@ fn default_settings() -> Settings {
         theme: "system".to_string(),
         last_page: "home".to_string(),
         update_manifest_url:
-            "https://raw.githubusercontent.com/weidonglang/dailytools/main/update-manifest.json"
+            "https://raw.githubusercontent.com/weidonglang/DevEnv-Manager/main/update-manifest.json"
                 .to_string(),
         port_process_exclusions: Vec::new(),
     }
@@ -5490,6 +5830,23 @@ fn set_user_environment_values(
         env_key
             .set_value("Path", &path)
             .map_err(|err| format!("写入 Path 失败：{err}"))?;
+        let saved_devenv = env_key
+            .get_value::<String, _>("DEVENV_HOME")
+            .map_err(|err| format!("校验 DEVENV_HOME 失败：{err}"))?;
+        let saved_path = env_key
+            .get_value::<String, _>("Path")
+            .map_err(|err| format!("校验 Path 失败：{err}"))?;
+        if path_key(&saved_devenv) != path_key(&display_path(&paths.root)) || saved_path != path {
+            return Err("用户环境变量写入后校验不一致，已停止并建议重新打开程序后重试".to_string());
+        }
+        if let Some(expected) = java_home {
+            let saved_java = env_key
+                .get_value::<String, _>("JAVA_HOME")
+                .map_err(|err| format!("校验 JAVA_HOME 失败：{err}"))?;
+            if path_key(&saved_java) != path_key(expected) {
+                return Err("JAVA_HOME 写入后校验不一致".to_string());
+            }
+        }
         Ok(())
     }
     #[cfg(not(windows))]
@@ -5563,7 +5920,7 @@ fn refresh_user_java_home(paths: &AppPaths) -> Result<(), String> {
         .or_else(|| environment.get("PATH"))
         .cloned()
         .unwrap_or_default();
-    set_user_environment_values(paths, selected.as_deref(), &current_path)?;
+    set_user_environment_values(paths, selected.as_deref(), &merge_path(&current_path))?;
     broadcast_environment_change();
     Ok(())
 }
@@ -5573,7 +5930,14 @@ fn select_java_home(
     user_environment: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
     let managed = paths.current().join("jdk");
-    if managed.join("bin/java.exe").is_file() && managed.join("bin/javac.exe").is_file() {
+    let managed_is_selected = load_installed(paths)
+        .ok()
+        .and_then(|installed| installed.current.jdk)
+        .is_some();
+    if managed_is_selected
+        && managed.join("bin/java.exe").is_file()
+        && managed.join("bin/javac.exe").is_file()
+    {
         return Some(r"%DEVENV_HOME%\current\jdk".to_string());
     }
     if let Some(value) = user_environment.get("JAVA_HOME") {
@@ -5588,6 +5952,132 @@ fn select_java_home(
         }
     }
     None
+}
+
+fn find_in_configured_path(
+    executable: &str,
+    path_value: &str,
+    paths: &AppPaths,
+) -> Option<PathBuf> {
+    for entry in path_value
+        .split(';')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let directory = PathBuf::from(expand_environment_path(entry, paths));
+        for suffix in [".exe", ".cmd", ".bat", ""] {
+            let candidate = directory.join(format!("{executable}{suffix}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn java_root_from_executable(executable: &Path) -> Option<PathBuf> {
+    executable.parent()?.parent().map(Path::to_path_buf)
+}
+
+fn first_output_line(executable: &Path, args: &[&str]) -> String {
+    run_command_output(executable.to_path_buf(), args, 30)
+        .unwrap_or_default()
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn inspect_java_environment_blocking() -> Result<JavaEnvironmentReport, String> {
+    let paths = load_paths()?;
+    let user = user_environment()?;
+    let java_home = user.get("JAVA_HOME").cloned().unwrap_or_default();
+    let java_home_expanded = if java_home.is_empty() {
+        String::new()
+    } else {
+        expand_environment_path(&java_home, &paths)
+    };
+    let path_value = user
+        .get("Path")
+        .or_else(|| user.get("PATH"))
+        .cloned()
+        .unwrap_or_default();
+    let path_java = find_in_configured_path("java", &path_value, &paths);
+    let path_javac = find_in_configured_path("javac", &path_value, &paths);
+    let java_version = path_java
+        .as_deref()
+        .map(|path| first_output_line(path, &["-version"]))
+        .unwrap_or_default();
+    let javac_version = path_javac
+        .as_deref()
+        .map(|path| first_output_line(path, &["-version"]))
+        .unwrap_or_default();
+    let expected_root =
+        (!java_home_expanded.is_empty()).then(|| PathBuf::from(&java_home_expanded));
+    let java_root = path_java.as_deref().and_then(java_root_from_executable);
+    let javac_root = path_javac.as_deref().and_then(java_root_from_executable);
+    let home_matches_java = match (&expected_root, &java_root) {
+        (Some(home), Some(root)) => path_key(&display_path(home)) == path_key(&display_path(root)),
+        (None, None) => true,
+        _ => false,
+    };
+    let java_matches_javac = match (&java_root, &javac_root) {
+        (Some(java), Some(javac)) => {
+            path_key(&display_path(java)) == path_key(&display_path(javac))
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let mut warnings = Vec::new();
+    if java_home.is_empty() {
+        warnings.push("JAVA_HOME 未设置".to_string());
+    } else if !is_valid_java_home(&java_home, &paths) {
+        warnings.push("JAVA_HOME 不包含可用的 java.exe 与 javac.exe".to_string());
+    }
+    if !home_matches_java {
+        warnings.push("JAVA_HOME 与用户 PATH 首个 java.exe 不一致".to_string());
+    }
+    if !java_matches_javac {
+        warnings.push("用户 PATH 中 java.exe 与 javac.exe 来自不同 JDK".to_string());
+    }
+    let candidates = discover_runtimes_blocking()
+        .into_iter()
+        .filter(|item| item.kind == "Java")
+        .collect::<Vec<_>>();
+    let effective_source = path_java
+        .as_deref()
+        .map(|path| classify_source(&display_path(path)))
+        .unwrap_or_else(|| "未发现".to_string());
+    let maven_runtime = resolve_tool(&paths, "mvn")
+        .map(|path| command_value(Some(path), &["-version"]))
+        .unwrap_or_default()
+        .lines()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let gradle_runtime = resolve_tool(&paths, "gradle")
+        .map(|path| command_value(Some(path), &["-version"]))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("JVM") || line.contains("Java"))
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    Ok(JavaEnvironmentReport {
+        java_home,
+        java_home_expanded,
+        path_java: path_java.as_deref().map(display_path).unwrap_or_default(),
+        path_javac: path_javac.as_deref().map(display_path).unwrap_or_default(),
+        java_version,
+        javac_version,
+        maven_runtime,
+        gradle_runtime,
+        effective_source,
+        consistent: warnings.is_empty(),
+        warnings,
+        candidates,
+    })
 }
 
 fn is_valid_java_home(value: &str, paths: &AppPaths) -> bool {
@@ -5787,7 +6277,7 @@ fn resolve_microsoft_jdk_release(version: &str) -> Result<ReleaseInfo, String> {
     let url = format!("https://aka.ms/download-jdk/microsoft-jdk-{version}-windows-x64.zip");
     let checksum_url = format!("{url}.sha256sum.txt");
     let client = reqwest::blocking::Client::builder()
-        .user_agent("DevEnvManager/1.0")
+        .user_agent("DevEnvManager/1.1")
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|err| format!("创建 Microsoft JDK 客户端失败：{err}"))?;
@@ -7382,13 +7872,22 @@ fn push_doctor_check(checks: &mut Vec<DoctorCheck>, score: &mut i32, check: Doct
     let penalty = match (check.severity.as_str(), check.status.as_str()) {
         ("warning", "异常" | "未安装" | "未设置" | "缺失" | "需修复") => 12,
         ("warning", _) => 8,
-        ("notice", "占用") => 5,
+        ("notice", "占用" | "可选缺失") => 0,
         ("notice", "不可访问") => 3,
         ("notice", _) => 2,
         _ => 0,
     };
     *score -= penalty;
     checks.push(check);
+}
+
+fn doctor_check_needs_attention(check: &DoctorCheck) -> bool {
+    check.severity == "warning"
+        || (check.severity == "notice"
+            && !matches!(
+                check.status.as_str(),
+                "正常" | "可选缺失" | "占用" | "已发现"
+            ))
 }
 
 fn optional_command_probe(name: &str, executable: &str, args: &[&str]) -> DoctorCheck {
@@ -8060,15 +8559,22 @@ fn dotnet_required_sdk(root: &Path) -> Option<String> {
 
 fn project_jdk_recommendation(root: &Path, fallback: &str) -> ProjectRuntimeRecommendation {
     let required = detect_project_jdk_requirement(root);
-    let current = detect_runtime("JDK", "java", &["-version"])
-        .map(|info| info.version)
+    let environment = inspect_java_environment_blocking().ok();
+    let current = environment
+        .as_ref()
+        .map(|report| report.java_version.clone())
         .unwrap_or_default();
     let current_major = normalize_java_requirement(&current);
     match required {
         Some(required) => ProjectRuntimeRecommendation {
             name: "JDK".to_string(),
             requirement: format!("项目配置建议 JDK {required}"),
-            status: if current_major.as_deref() == Some(required.as_str()) {
+            status: if environment
+                .as_ref()
+                .is_some_and(|report| !report.consistent)
+            {
+                "JAVA_HOME 与 PATH 不一致，请先修复".to_string()
+            } else if current_major.as_deref() == Some(required.as_str()) {
                 "版本匹配".to_string()
             } else if current.is_empty() {
                 "未发现 JDK".to_string()
@@ -8174,6 +8680,8 @@ fn project_signals(root: &Path) -> Vec<String> {
         "go.mod",
         "go.sum",
         "global.json",
+        "bin/startup.cmd",
+        "conf/application.properties",
     ] {
         if root.join(file).exists() {
             signals.push(file.to_string());
@@ -8321,6 +8829,40 @@ mod tests {
             vec![r"C:\Program Files\App\uninstall.exe", "/S"]
         );
         assert!(parse_command_line(r#"node "unterminated"#).is_err());
+    }
+
+    #[test]
+    fn command_panel_blocks_shells_and_destructive_git() {
+        let powershell = assess_command_safety("powershell -Command Get-ChildItem").unwrap();
+        assert!(!powershell.allowed);
+        let destructive = assess_command_safety("git reset --hard").unwrap();
+        assert!(!destructive.allowed);
+        let safe = assess_command_safety("node --version").unwrap();
+        assert!(safe.allowed);
+        assert!(!safe.requires_confirmation || safe.elevated);
+    }
+
+    #[test]
+    fn package_install_requires_command_panel_confirmation() {
+        let assessment = assess_command_safety("npm install vite").unwrap();
+        assert!(assessment.allowed);
+        assert!(assessment.requires_confirmation);
+    }
+
+    #[test]
+    fn project_signals_recognize_nacos_layout() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("bin")).unwrap();
+        fs::create_dir_all(root.path().join("conf")).unwrap();
+        fs::write(root.path().join("bin/startup.cmd"), "@echo off").unwrap();
+        fs::write(
+            root.path().join("conf/application.properties"),
+            "server.port=8848",
+        )
+        .unwrap();
+        let signals = project_signals(root.path());
+        assert!(signals.contains(&"bin/startup.cmd".to_string()));
+        assert!(signals.contains(&"conf/application.properties".to_string()));
     }
 
     #[test]
@@ -8487,13 +9029,21 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_architecture_enables_preview_but_never_empties_recycle_bin() {
+    fn cleanup_architecture_is_scan_only() {
         let architecture = cleanup::architecture();
-        assert_eq!(architecture.status, "preview-and-recycle-bin");
-        assert!(architecture
+        assert_eq!(architecture.status, "scan-only-phase-1");
+        assert!(!architecture
             .categories
             .iter()
             .any(|category| category.cleanup_enabled));
+        assert!(!architecture
+            .categories
+            .iter()
+            .any(|category| category.id == "user-space"));
+        assert!(architecture
+            .categories
+            .iter()
+            .any(|category| category.id == "wps-cache"));
         let recycle_bin = architecture
             .categories
             .iter()

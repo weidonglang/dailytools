@@ -89,6 +89,21 @@ type RuntimeInfo = {
   source: string;
 };
 
+type JavaEnvironmentReport = {
+  javaHome: string;
+  javaHomeExpanded: string;
+  pathJava: string;
+  pathJavac: string;
+  javaVersion: string;
+  javacVersion: string;
+  mavenRuntime: string;
+  gradleRuntime: string;
+  effectiveSource: string;
+  consistent: boolean;
+  warnings: string[];
+  candidates: RuntimeInfo[];
+};
+
 type PortRecord = {
   protocol: string;
   localAddress: string;
@@ -153,6 +168,28 @@ type CommandRunResult = {
   returnCode: number;
   output: string;
   elapsedMs: number;
+};
+
+type CommandSafetyAssessment = {
+  allowed: boolean;
+  risk: string;
+  reason: string;
+  requiresConfirmation: boolean;
+  elevated: boolean;
+  executable: string;
+};
+
+type AgentTraceReport = {
+  generatedAt: string;
+  items: Array<{
+    source: string;
+    path: string;
+    evidence: string;
+    confidence: string;
+    recommendation: string;
+  }>;
+  privacyNotice: string;
+  limitations: string[];
 };
 
 type EnvHealthCheck = {
@@ -365,6 +402,7 @@ type UpdateCheckResult = {
   notes: string[];
   downloadUrl: string;
   sha256: string;
+  checkedAt: string;
 };
 
 type CleanupArchitecture = {
@@ -409,30 +447,65 @@ type ProfileRequirement = {
 
 type CleanupCandidate = {
   id: string;
-  categoryId: string;
-  categoryName: string;
   path: string;
   size: number;
-  modifiedAt: number;
-  risk: string;
-  selectedByDefault: boolean;
+  modifiedAt?: string;
+  source: string;
   reason: string;
+  risk: string;
+  cleanable: boolean;
+  selectedByDefault: boolean;
+  skippedReason?: string;
+};
+
+type CleanupCategoryScan = {
+  id: string;
+  name: string;
+  description: string;
+  risk: string;
+  scanOnly: boolean;
+  cleanable: boolean;
+  enabledByDefault: boolean;
+  totalBytes: number;
+  itemCount: number;
+  items: CleanupCandidate[];
 };
 
 type CleanupScanReport = {
-  generatedAt: number;
-  totalSize: number;
-  defaultSelectedSize: number;
-  candidates: CleanupCandidate[];
-  truncated: boolean;
-  notes: string[];
+  generatedAt: string;
+  totalBytes: number;
+  totalItems: number;
+  categories: CleanupCategoryScan[];
+  warnings: string[];
 };
 
-type CleanupRunResult = {
-  cleanedCount: number;
-  reclaimedBytes: number;
-  skipped: string[];
-  historyFile: string;
+type DiskVolumeInfo = {
+  drive: string;
+  totalBytes: number;
+  freeBytes: number;
+  usedBytes: number;
+  usedPercent: number;
+  fileSystem?: string;
+  risk: string;
+};
+
+type MaintenanceOverview = {
+  cDrive: DiskVolumeInfo;
+  volumes: DiskVolumeInfo[];
+  safeCleanEstimate: number;
+  moveEstimate: number;
+  devCacheEstimate: number;
+  largeFileCount: number;
+  startupCount: number;
+  memorySummary?: {
+    totalBytes: number;
+    usedBytes: number;
+    availableBytes: number;
+    usedPercent: number;
+  };
+  riskLevel: string;
+  summary: string;
+  suggestions: string[];
 };
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -460,6 +533,7 @@ app.innerHTML = `
         <button class="nav-item" data-view="project">${icon(FolderSearch)}<span>项目</span></button>
         <button class="nav-item" data-view="toolchains">${icon(PackageCheck)}<span>工具链</span></button>
         <button class="nav-item" data-view="platforms">${icon(Cpu)}<span>平台/镜像</span></button>
+        <button class="nav-item" data-view="maintenance">${icon(Shield)}<span>C盘急救</span></button>
         <button class="nav-item" data-view="toolbox">${icon(Hammer)}<span>工具箱</span></button>
       </nav>
     </aside>
@@ -476,6 +550,10 @@ app.innerHTML = `
         <div><strong id="task-progress-title">任务</strong><span id="task-progress-message">等待中</span></div>
         <div class="progress-track"><span id="task-progress-bar"></span></div>
       </div>
+      <details id="view-guide" class="view-guide">
+        <summary>${icon(FileText)}<span>这个页面怎么用？</span></summary>
+        <p id="view-guide-text">先看系统快照和当前生效工具；需要深入排查时再进入环境医生。</p>
+      </details>
 
       <section id="view-overview" class="view active">
         <div class="metrics">
@@ -496,6 +574,13 @@ app.innerHTML = `
             <strong id="metric-warnings">0</strong>
           </article>
         </div>
+        <section class="panel effective-environment-panel">
+          <div class="panel-head">
+            <div class="panel-title">${icon(Terminal)}<h2>当前实际生效环境</h2></div>
+            <small>每 30 秒只读刷新</small>
+          </div>
+          <div id="effective-runtime-list" class="effective-runtime-list"><div class="empty">正在读取当前工具版本</div></div>
+        </section>
         <div class="grid two">
           <section class="panel">
             <div class="panel-title">${icon(Activity)}<h2>系统快照</h2></div>
@@ -605,15 +690,13 @@ app.innerHTML = `
       </section>
 
       <section id="view-runtimes" class="view">
-        <section class="panel">
-          <div class="panel-head">
-            <div class="panel-title">${icon(Terminal)}<h2>本机环境发现</h2></div>
-            <button id="discover-runtimes">${icon(RefreshCw)}<span>发现</span></button>
-          </div>
+        <details class="panel discovery-panel">
+          <summary><span>${icon(Terminal)}<strong>本机环境发现</strong><small>默认折叠，展开查看全部来源</small></span></summary>
+          <div class="panel-head discovery-actions"><span></span><button id="discover-runtimes">${icon(RefreshCw)}<span>重新发现</span></button></div>
           <div id="runtime-list" class="runtime-list"></div>
-        </section>
+        </details>
         <section class="panel runtime-manager">
-          <div class="panel-title">${icon(Download)}<h2>JDK 管理</h2></div>
+          <div class="panel-head"><div class="panel-title">${icon(Download)}<h2>JDK 管理</h2></div><button id="inspect-java">${icon(Activity)}<span>检查当前 JDK</span></button></div>
           <div class="toolbar">
             <select id="jdk-distribution"></select>
             <select id="jdk-version">
@@ -625,6 +708,7 @@ app.innerHTML = `
             </select>
             <button id="install-jdk">${icon(Download)}<span>安装</span></button>
           </div>
+          <div id="java-environment" class="java-environment"><div class="empty">点击“检查当前 JDK”核对 JAVA_HOME、PATH、java、javac、Maven 和 Gradle</div></div>
           <div id="managed-jdks" class="runtime-list"></div>
         </section>
         <section class="panel runtime-manager">
@@ -852,6 +936,53 @@ app.innerHTML = `
         </section>
       </section>
 
+      <section id="view-maintenance" class="view maintenance-view">
+        <section class="maintenance-hero">
+          <div>
+            <span class="phase-badge">Phase 1 · Scan only</span>
+            <h2>C 盘急救大师</h2>
+            <p>先看清空间去了哪里，再决定下一步。本阶段只读扫描，不删除、不移动、不修改任何文件。</p>
+          </div>
+          <div class="toolbar compact">
+            <button id="inspect-maintenance" class="primary">${icon(Activity)}<span>开始体检</span></button>
+            <button id="scan-maintenance">${icon(Search)}<span>只读扫描</span></button>
+          </div>
+        </section>
+        <nav class="maintenance-tabs" aria-label="C 盘急救功能">
+          <button class="active" data-maintenance-tab="overview">总览</button>
+          <button data-maintenance-tab="cleanup">C盘专清</button>
+          <button data-maintenance-tab="dev-cache">开发缓存</button>
+          <button data-maintenance-tab="analysis">空间分析</button>
+          <button data-maintenance-tab="move">空间搬家</button>
+          <button data-maintenance-tab="expand">扩容检测</button>
+          <button data-maintenance-tab="startup">启动项/进程</button>
+          <button data-maintenance-tab="report">报告</button>
+        </nav>
+
+        <section class="maintenance-panel active" data-maintenance-panel="overview">
+          <div id="maintenance-overview"><div class="empty">点击“开始体检”读取 C 盘与各分区容量</div></div>
+        </section>
+        <section class="maintenance-panel" data-maintenance-panel="cleanup">
+          <div class="scan-only-banner">${icon(Shield)}<span>仅扫描：Windows Temp、回收站、错误报告和系统缓存都不会被清理。</span></div>
+          <div id="maintenance-cleanup-categories"><div class="empty">点击“只读扫描”生成真实扫描结果</div></div>
+        </section>
+        <section class="maintenance-panel" data-maintenance-panel="dev-cache">
+          <div class="scan-only-banner">${icon(Shield)}<span>仅扫描：npm、pnpm、Yarn、pip、uv、Poetry、Maven、Gradle、Cargo、Go 与 NuGet 缓存。</span></div>
+          <div id="maintenance-dev-categories"><div class="empty">点击“只读扫描”统计开发缓存</div></div>
+        </section>
+        ${[
+          ["analysis", "空间分析", "大文件明细与目录树将在后续阶段开放。"],
+          ["move", "空间搬家", "后续阶段会提供可预览、可回滚的目录迁移。"],
+          ["expand", "扩容检测", "后续阶段会检测分区布局与可扩容条件。"],
+          ["startup", "启动项/进程", "Phase 1 仅在总览统计启动目录项目数量。"],
+          ["report", "报告", "后续阶段会支持导出体检与执行记录。"],
+        ].map(([id, title, text]) => `
+          <section class="maintenance-panel" data-maintenance-panel="${id}">
+            <div class="panel maintenance-placeholder"><h2>${title}</h2><p>${text}</p><span>Phase 1 暂未开放</span></div>
+          </section>
+        `).join("")}
+      </section>
+
       <section id="view-toolbox" class="view">
         <div class="grid two">
           <section class="panel">
@@ -872,6 +1003,7 @@ app.innerHTML = `
               <input id="wsl-distro-name" value="Ubuntu" placeholder="WSL 在线发行版名称" />
               <button data-action="system-platform" data-platform-action="wsl_install_distro">${icon(Download)}<span>安装发行版</span></button>
             </div>
+            <div class="small-note">Windows 主机与 WSL 是两套独立环境。本项目当前管理发行版状态；WSL 内的 SDK 优先交给 mise/asdf/sdkman/pyenv/nvm/rustup 等成熟工具。</div>
           </section>
           <section class="panel">
             <div class="panel-head">
@@ -903,6 +1035,7 @@ app.innerHTML = `
         </div>
         <section class="panel runtime-manager">
           <div class="panel-title">${icon(Terminal)}<h2>命令面板</h2></div>
+          <div class="advanced-warning">${icon(Shield)}<span><strong>高级功能 · 安全模式</strong> 仅允许常见开发工具；系统 Shell、磁盘、注册表、权限和破坏性 Git 命令会被后端拒绝。不要粘贴不理解的 AI/网页命令。</span></div>
           <div class="form-row command-row">
             <input id="command-input" value="node --version" />
             <input id="command-cwd" placeholder="工作目录，可留空" />
@@ -912,26 +1045,24 @@ app.innerHTML = `
         </section>
         <section class="panel runtime-manager">
           <div class="panel-head">
+            <div class="panel-title">${icon(Search)}<h2>AI Agent / CLI 痕迹</h2></div>
+            <button id="inspect-agent-traces">${icon(Shield)}<span>只读分析</span></button>
+          </div>
+          <div class="small-note">只有主动点击后才读取本地路径和文件名；不读取会话正文、shell history、token 或密钥，不上传任何数据。</div>
+          <div id="agent-trace-result"><div class="empty">尚未分析 Agent / CLI 痕迹</div></div>
+        </section>
+        <section class="panel runtime-manager">
+          <div class="panel-head">
             <div class="panel-title">${icon(RefreshCw)}<h2>版本更新</h2></div>
             <div class="toolbar compact">
               <label class="toggle-row" title="程序启动后在后台检查 GitHub 更新清单">
                 <input id="auto-check-updates" type="checkbox" />
-                <span>启动时检查</span>
+                <span>启动时检查（每天最多一次，仅取版本号，不上传遥测）</span>
               </label>
               <button id="check-updates">${icon(RefreshCw)}<span>检查更新</span></button>
             </div>
           </div>
           <div id="update-result"><div class="empty">尚未检查新版本</div></div>
-        </section>
-        <section class="panel runtime-manager cleanup-architecture">
-          <div class="panel-head">
-            <div class="panel-title">${icon(Trash2)}<h2>存储空间清理</h2></div>
-            <div class="toolbar compact">
-              <button id="scan-storage">${icon(Search)}<span>扫描</span></button>
-              <button id="clean-storage" class="danger-button" disabled>${icon(Trash2)}<span>移入回收站</span></button>
-            </div>
-          </div>
-          <div id="cleanup-architecture-result"><div class="empty">正在读取安全架构</div></div>
         </section>
         <section class="panel runtime-manager danger-panel">
           <div class="panel-title">${icon(Trash2)}<h2>卸载本程序</h2></div>
@@ -969,6 +1100,7 @@ const state = {
   env: null as EnvSnapshot | null,
   config: null as ConfigView | null,
   runtimes: [] as RuntimeInfo[],
+  javaEnvironment: null as JavaEnvironmentReport | null,
   ports: [] as PortRecord[],
   portHistory: [] as PortHistorySummary[],
   selectedPort: null as PortRecord | null,
@@ -987,10 +1119,12 @@ const state = {
   localServices: [] as LocalServiceStatus[],
   jdkDistributions: [] as JdkDistribution[],
   update: null as UpdateCheckResult | null,
+  updateError: "",
   updateDownloaded: false,
+  agentTraces: null as AgentTraceReport | null,
   cleanupArchitecture: null as CleanupArchitecture | null,
   cleanupReport: null as CleanupScanReport | null,
-  cleanupSelected: new Set<string>(),
+  maintenanceOverview: null as MaintenanceOverview | null,
 };
 
 const portState = {
@@ -1133,6 +1267,7 @@ function renderEnv() {
 
 function renderRuntimes() {
   setText("metric-runtimes", state.runtimes.length);
+  renderEffectiveRuntimes();
   const element = document.querySelector<HTMLElement>("#runtime-list");
   if (!element) return;
   element.innerHTML = state.runtimes.length
@@ -1142,7 +1277,7 @@ function renderRuntimes() {
             <article class="runtime">
               <div><strong>${escapeHtml(runtime.kind)}</strong><span>${escapeHtml(runtime.version)}</span></div>
               <small>${escapeHtml(runtime.source)} · ${escapeHtml(runtime.executable)}</small>
-              ${canUninstallExternal(runtime) ? `<div class="row-actions"><button data-action="uninstall-external-runtime" data-kind="${escapeHtml(runtime.kind)}" data-executable="${escapeHtml(runtime.executable)}">${icon(Trash2)}<span>系统卸载</span></button></div>` : ""}
+              ${canUninstallExternal(runtime) ? `<div class="row-actions"><button data-action="uninstall-external-runtime" data-kind="${escapeHtml(runtime.kind)}" data-source="${escapeHtml(runtime.source)}" data-executable="${escapeHtml(runtime.executable)}">${icon(Trash2)}<span>${runtime.source === "Scoop" || runtime.source === "Chocolatey" ? "用包管理器卸载" : "系统卸载"}</span></button></div>` : ""}
             </article>
           `,
         )
@@ -1153,6 +1288,57 @@ function renderRuntimes() {
   renderManagedPythons();
   renderManagedBuildTools();
   renderManagedGos();
+}
+
+function renderEffectiveRuntimes() {
+  const element = document.querySelector<HTMLElement>("#effective-runtime-list");
+  if (!element) return;
+  const preferredKinds = ["Java", "Python", "Node.js", "Maven", "Gradle", "Go"];
+  const effective = preferredKinds
+    .map((kind) => state.runtimes.find((runtime) => runtime.kind === kind))
+    .filter((runtime): runtime is RuntimeInfo => Boolean(runtime));
+  element.innerHTML = effective.length
+    ? effective.map((runtime) => `
+        <article>
+          <span>${escapeHtml(runtime.kind)}</span>
+          <strong>${escapeHtml(runtime.version.split("\n")[0] || "未知版本")}</strong>
+          <small>${escapeHtml(runtime.source)} · ${escapeHtml(runtime.executable)}</small>
+        </article>
+      `).join("")
+    : `<div class="empty">尚未发现当前可执行工具</div>`;
+}
+
+function renderJavaEnvironment() {
+  const element = document.querySelector<HTMLElement>("#java-environment");
+  const report = state.javaEnvironment;
+  if (!element || !report) return;
+  element.innerHTML = `
+    <div class="java-health ${report.consistent ? "ok" : "warn"}">
+      <strong>${report.consistent ? "JDK 生效链一致" : "JDK 生效链存在冲突"}</strong>
+      <span>实际来源：${escapeHtml(report.effectiveSource)}</span>
+    </div>
+    <div class="kv-list">
+      <div><span>JAVA_HOME</span><strong>${escapeHtml(report.javaHome || "未设置")}</strong></div>
+      <div><span>PATH java</span><strong>${escapeHtml(report.pathJava || "未发现")}</strong></div>
+      <div><span>PATH javac</span><strong>${escapeHtml(report.pathJavac || "未发现")}</strong></div>
+      <div><span>java -version</span><strong>${escapeHtml(report.javaVersion || "未读取")}</strong></div>
+      <div><span>javac -version</span><strong>${escapeHtml(report.javacVersion || "未读取")}</strong></div>
+      <div><span>Maven 使用环境</span><strong>${escapeHtml(report.mavenRuntime || "未安装/未读取")}</strong></div>
+      <div><span>Gradle 使用 JVM</span><strong>${escapeHtml(report.gradleRuntime || "未安装/未读取")}</strong></div>
+    </div>
+    ${report.warnings.length ? `<ul class="warning-text">${report.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+async function inspectJava(showProgress = true) {
+  if (showProgress) showToast("正在核对 JAVA_HOME、PATH、java、javac、Maven 与 Gradle");
+  try {
+    state.javaEnvironment = await invoke<JavaEnvironmentReport>("inspect_java_environment");
+    renderJavaEnvironment();
+    if (showProgress) showToast(state.javaEnvironment.consistent ? "当前 JDK 生效链一致" : "发现 JDK 生效冲突", !state.javaEnvironment.consistent);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
 }
 
 function renderManagedJdks() {
@@ -1460,8 +1646,7 @@ function renderDoctor() {
     suggestions.innerHTML = "";
     return;
   }
-  const warningCount = report.checks.filter((item) => item.severity !== "info" || item.status !== "正常").length;
-  score.innerHTML = `<strong>${report.score}</strong><span>${escapeHtml(report.summary)} · ${warningCount} 项需要关注</span>`;
+  score.innerHTML = `<strong>${report.score}</strong><span>${escapeHtml(report.summary)}</span>`;
   suggestions.innerHTML = report.suggestions
     .map(
       (item) => `
@@ -1913,7 +2098,11 @@ async function refreshBase() {
   renderPythonAnalysis();
   renderRuntimes();
   renderJdkDistributions();
-  renderCleanupArchitecture();
+  renderJavaEnvironment();
+  renderAgentTraces();
+  renderUpdate();
+  renderMaintenanceOverview();
+  renderMaintenanceScan();
   renderPorts();
   const autoCheckUpdates = document.querySelector<HTMLInputElement>("#auto-check-updates");
   if (autoCheckUpdates) autoCheckUpdates.checked = config.settings.autoCheckUpdate;
@@ -1978,6 +2167,7 @@ async function runRuntimeOperation(
     state.runtimes = runtimes;
     renderHealth();
     renderRuntimes();
+    if (focus === "JDK") await inspectJava(false);
     const check = health.find((item) => item.name.toLowerCase() === focus.toLowerCase());
     if (check && check.status !== "正常") {
       showToast(`${message}；${focus} 验证结果：${check.status}，${check.detail}`, true);
@@ -2217,11 +2407,17 @@ function renderCache() {
 function renderUpdate() {
   const element = document.querySelector<HTMLElement>("#update-result");
   const update = state.update;
-  if (!element || !update) return;
+  if (!element) return;
+  if (!update) {
+    element.innerHTML = state.updateError
+      ? `<div class="empty warning-text">最近检查失败：${escapeHtml(state.updateError)}</div>`
+      : `<div class="empty">尚未检查新版本</div>`;
+    return;
+  }
   element.innerHTML = `
     <div class="project-summary">
       <strong>当前 ${escapeHtml(update.currentVersion)} · 最新 ${escapeHtml(update.latestVersion)}</strong>
-      <span>${update.updateAvailable ? "发现新版本" : "当前已是最新版本"} · ${escapeHtml(update.date)}</span>
+      <span>${update.updateAvailable ? "发现新版本" : "当前已是最新版本"} · 发布 ${escapeHtml(update.date)} · 检查 ${escapeHtml(update.checkedAt)}</span>
     </div>
     ${update.notes.length ? `<ul>${update.notes.map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>` : ""}
     <div class="toolbar compact">
@@ -2232,70 +2428,124 @@ function renderUpdate() {
   `;
 }
 
-function renderCleanupArchitecture() {
-  const element = document.querySelector<HTMLElement>("#cleanup-architecture-result");
-  const architecture = state.cleanupArchitecture;
-  if (!element || !architecture) return;
-  const report = state.cleanupReport;
-  const selectedSize = report?.candidates
-    .filter((item) => state.cleanupSelected.has(item.id))
-    .reduce((sum, item) => sum + item.size, 0) || 0;
-  const cleanButton = document.querySelector<HTMLButtonElement>("#clean-storage");
-  if (cleanButton) {
-    cleanButton.disabled = state.cleanupSelected.size === 0;
-    cleanButton.querySelector("span")!.textContent = state.cleanupSelected.size
-      ? `移入回收站（${state.cleanupSelected.size}）`
-      : "移入回收站";
-  }
+function riskText(risk: string) {
+  return ({ critical: "严重", high: "高", medium: "中", low: "低", unknown: "未知" } as Record<string, string>)[risk] || risk;
+}
+
+function renderAgentTraces() {
+  const element = document.querySelector<HTMLElement>("#agent-trace-result");
+  const report = state.agentTraces;
+  if (!element || !report) return;
   element.innerHTML = `
-    <div class="cleanup-category-grid">
-      ${architecture.categories
-        .map(
-          (category) => `
-            <article class="runtime cleanup-category">
-              <div><strong>${escapeHtml(category.name)}</strong><span>${category.cleanupEnabled ? "可安全清理" : "仅供系统管理"}</span></div>
-              <small>风险：${escapeHtml(category.risk)} · 保护：${escapeHtml(category.protectedPatterns.join("、"))}</small>
-            </article>
-          `,
-        )
-        .join("")}
+    <div class="privacy-notice">${icon(Shield)}<span>${escapeHtml(report.privacyNotice)}</span></div>
+    <div class="runtime-list agent-trace-list">
+      ${report.items.map((item) => `
+        <article class="runtime">
+          <div><strong>${escapeHtml(item.source)}</strong><span>置信度：${escapeHtml(item.confidence)}</span></div>
+          <small>${escapeHtml(item.path)}</small>
+          <small>${escapeHtml(item.evidence)}</small>
+          <small>${escapeHtml(item.recommendation)}</small>
+        </article>
+      `).join("") || `<div class="empty">没有发现可验证的 Agent / CLI 安装痕迹</div>`}
     </div>
-    ${report ? `
-      <div class="cleanup-summary">
-        <div><strong>${formatBytes(report.totalSize)}</strong><span>${report.candidates.length} 个候选项</span></div>
-        <div><strong>${formatBytes(selectedSize)}</strong><span>当前选择</span></div>
-        <div class="toolbar compact">
-          <button data-action="cleanup-select-defaults">选择建议项</button>
-          <button data-action="cleanup-clear-selection">清空选择</button>
-        </div>
-      </div>
-      ${report.truncated ? `<div class="small-note warning-text">候选项较多，仅显示体积最大的 500 项。</div>` : ""}
-      <div class="cleanup-candidate-list">
-        ${report.candidates.map((item) => `
-          <label class="cleanup-candidate ${item.risk === "high" ? "high-risk" : ""}">
-            <input type="checkbox" data-cleanup-id="${escapeHtml(item.id)}" ${state.cleanupSelected.has(item.id) ? "checked" : ""} />
-            <span class="cleanup-candidate-main">
-              <strong>${escapeHtml(item.categoryName)} · ${formatBytes(item.size)}</strong>
-              <small>${escapeHtml(item.path)}</small>
-              <small>${escapeHtml(item.reason)} · 风险 ${escapeHtml(item.risk)}</small>
-            </span>
-          </label>
-        `).join("") || `<div class="empty">没有发现可清理项目</div>`}
-      </div>
-      <ul>${report.notes.map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>
-    ` : `<ul>${architecture.safetyRules.map((rule) => `<li>${escapeHtml(rule)}</li>`).join("")}</ul>`}
+    <ul>${report.limitations.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
   `;
 }
 
-async function scanStorageCleanup(showProgress = true) {
-  if (showProgress) showToast("正在统计可安全清理的空间");
+function renderMaintenanceOverview() {
+  const element = document.querySelector<HTMLElement>("#maintenance-overview");
+  const overview = state.maintenanceOverview;
+  if (!element || !overview) return;
+  const cDrive = overview.cDrive;
+  element.innerHTML = `
+    <div class="maintenance-metrics">
+      <article class="maintenance-metric risk-${escapeHtml(overview.riskLevel)}">
+        <span>C 盘剩余</span><strong>${formatBytes(cDrive.freeBytes || 0)}</strong>
+        <small>${cDrive.totalBytes ? `已用 ${cDrive.usedPercent.toFixed(1)}%` : "未识别 C 盘"} · ${riskText(overview.riskLevel)}风险</small>
+      </article>
+      <article class="maintenance-metric"><span>可清理空间估算</span><strong>${formatBytes(overview.safeCleanEstimate)}</strong><small>仅估算，本阶段不执行</small></article>
+      <article class="maintenance-metric"><span>开发缓存</span><strong>${formatBytes(overview.devCacheEstimate)}</strong><small>包管理器与构建缓存</small></article>
+      <article class="maintenance-metric protected"><span>个人目录</span><strong>默认排除</strong><small>桌面、下载、文档、图片、视频、音乐均不进入扫描</small></article>
+    </div>
+    <div class="grid two maintenance-grid">
+      <section class="panel">
+        <div class="panel-title">${icon(Database)}<h2>磁盘容量</h2></div>
+        <div class="volume-list">
+          ${overview.volumes.map((volume) => `
+            <article class="volume-row">
+              <div><strong>${escapeHtml(volume.drive)}</strong><span class="risk-chip risk-${escapeHtml(volume.risk)}">${riskText(volume.risk)}风险</span></div>
+              <div class="volume-track"><span style="width:${Math.min(100, volume.usedPercent).toFixed(1)}%"></span></div>
+              <small>已用 ${formatBytes(volume.usedBytes)} / ${formatBytes(volume.totalBytes)} · 剩余 ${formatBytes(volume.freeBytes)}${volume.fileSystem ? ` · ${escapeHtml(volume.fileSystem)}` : ""}</small>
+            </article>
+          `).join("") || `<div class="empty">没有读取到磁盘卷</div>`}
+        </div>
+      </section>
+      <section class="panel maintenance-advice">
+        <div class="panel-title">${icon(Shield)}<h2>体检结论</h2></div>
+        <p>${escapeHtml(overview.summary)}</p>
+        <div class="maintenance-facts">
+          <span>大目录 ${overview.largeFileCount} 个</span><span>启动目录项目 ${overview.startupCount} 个</span>
+          ${overview.memorySummary ? `<span>内存已用 ${overview.memorySummary.usedPercent.toFixed(1)}%</span>` : ""}
+        </div>
+        <ul>${overview.suggestions.map((suggestion) => `<li>${escapeHtml(suggestion)}</li>`).join("")}</ul>
+      </section>
+    </div>
+  `;
+}
+
+function renderScanCategories(target: string, categoryIds: string[]) {
+  const element = document.querySelector<HTMLElement>(target);
+  if (!element) return;
+  const report = state.cleanupReport;
+  if (!report) return;
+  const categories = report.categories.filter((category) => categoryIds.includes(category.id));
+  element.innerHTML = `
+    <div class="scan-summary"><strong>${formatBytes(categories.reduce((sum, item) => sum + item.totalBytes, 0))}</strong><span>${categories.reduce((sum, item) => sum + item.itemCount, 0)} 个只读统计项</span></div>
+    <div class="maintenance-category-list">
+      ${categories.map((category) => `
+        <details class="maintenance-category" ${category.totalBytes ? "open" : ""}>
+          <summary>
+            <span><strong>${escapeHtml(category.name)}</strong><small>${escapeHtml(category.description)}</small></span>
+            <span><b>${formatBytes(category.totalBytes)}</b><i class="risk-chip risk-${escapeHtml(category.risk)}">${riskText(category.risk)}风险</i></span>
+          </summary>
+          <div class="maintenance-items">
+            ${category.items.map((item) => `
+              <article class="maintenance-item">
+                <div><strong>${escapeHtml(item.source)}</strong><span>${formatBytes(item.size)}</span></div>
+                <small>${escapeHtml(item.path)}</small>
+                <small>${escapeHtml(item.skippedReason || item.reason)} · ${item.cleanable ? "未来可评估清理" : "受保护 / 仅统计"}</small>
+              </article>
+            `).join("") || `<div class="empty">目录不存在或占用为 0</div>`}
+          </div>
+        </details>
+      `).join("")}
+    </div>
+    <ul class="scan-warnings">${report.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>
+  `;
+}
+
+function renderMaintenanceScan() {
+  renderScanCategories("#maintenance-cleanup-categories", ["windows-temp", "system-caches", "recycle-bin", "devenv-manager", "wps-cache"]);
+  renderScanCategories("#maintenance-dev-categories", ["developer-caches"]);
+}
+
+async function inspectMaintenance() {
+  showToast("正在进行 C 盘只读体检，较大的缓存目录可能需要一些时间");
   try {
-    state.cleanupReport = await invoke<CleanupScanReport>("scan_storage_cleanup");
-    state.cleanupSelected = new Set(
-      state.cleanupReport.candidates.filter((item) => item.selectedByDefault).map((item) => item.id),
-    );
-    renderCleanupArchitecture();
-    if (showProgress) showToast(`扫描完成，可检查 ${formatBytes(state.cleanupReport.totalSize)}`);
+    state.maintenanceOverview = await invoke<MaintenanceOverview>("inspect_maintenance_overview");
+    renderMaintenanceOverview();
+    showToast(`体检完成：C 盘${riskText(state.maintenanceOverview.riskLevel)}风险`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function scanMaintenance() {
+  showToast("正在执行只读扫描，不会删除任何文件");
+  try {
+    state.cleanupReport = await invoke<CleanupScanReport>("scan_cleanup_targets");
+    renderMaintenanceScan();
+    showToast(`扫描完成：${state.cleanupReport.totalItems} 项，共 ${formatBytes(state.cleanupReport.totalBytes)}`);
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error), true);
   }
@@ -2315,6 +2565,20 @@ function activateView(view: string) {
   document.querySelectorAll(".view").forEach((item) => {
     item.classList.toggle("active", item.id === `view-${view}`);
   });
+  const guides: Record<string, string> = {
+    overview: "先确认当前实际生效的工具版本与路径；这里只读刷新，不会修改环境。",
+    doctor: "先运行一键诊断，再逐条查看证据。安全修复只处理用户级 PATH 与受管环境变量。",
+    ports: "搜索端口、进程或框架名称；结束进程前务必确认它不是系统或仍在使用的服务。",
+    runtimes: "本机发现默认折叠。JDK 切换后请用“检查当前 JDK”核对 JAVA_HOME、PATH、java 和 javac。",
+    environment: "配置操作只写当前用户环境变量，并保留快照；新终端或 IDE 才会继承修改。",
+    project: "选择项目根目录后只读分析配置；运行按钮只接受后端生成的固定 action id。",
+    toolchains: "优先检测并调用 Git、npm、pnpm、uv 等成熟工具，不替代它们。",
+    platforms: "用于诊断 Go、Rust、.NET 与镜像配置；写配置前会备份或明确确认。",
+    maintenance: "默认不进入任何个人目录；当前版本只扫描并预览，不删除文件。",
+    toolbox: "命令面板是高级功能且启用白名单；不要粘贴不理解的 AI 或网页命令。",
+  };
+  const guide = document.querySelector<HTMLElement>("#view-guide-text");
+  if (guide) guide.textContent = guides[view] || guides.overview;
 }
 
 function escapeHtml(value: string) {
@@ -2331,7 +2595,19 @@ function escapeHtml(value: string) {
 }
 
 document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) => {
-  button.addEventListener("click", () => activateView(button.dataset.view || "overview"));
+  button.addEventListener("click", () => {
+    const view = button.dataset.view || "overview";
+    activateView(view);
+    if (view === "maintenance" && !state.maintenanceOverview) void inspectMaintenance();
+  });
+});
+
+document.querySelectorAll<HTMLButtonElement>("[data-maintenance-tab]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const tab = button.dataset.maintenanceTab || "overview";
+    document.querySelectorAll("[data-maintenance-tab]").forEach((item) => item.classList.toggle("active", item === button));
+    document.querySelectorAll<HTMLElement>("[data-maintenance-panel]").forEach((panel) => panel.classList.toggle("active", panel.dataset.maintenancePanel === tab));
+  });
 });
 
 document.querySelector("#refresh-all")?.addEventListener("click", () => void refreshAll(true));
@@ -2624,38 +2900,20 @@ document.querySelector("#load-cache")?.addEventListener("click", async () => {
 document.querySelector("#clear-cache")?.addEventListener("click", () => {
   void runOperation(() => invoke<OperationResult>("clear_download_cache"), "正在清理下载缓存");
 });
-document.querySelector("#scan-storage")?.addEventListener("click", () => void scanStorageCleanup());
-document.querySelector("#clean-storage")?.addEventListener("click", async () => {
-  const report = state.cleanupReport;
-  const ids = [...state.cleanupSelected];
-  if (!report || !ids.length) return;
-  const size = report.candidates
-    .filter((item) => state.cleanupSelected.has(item.id))
-    .reduce((sum, item) => sum + item.size, 0);
-  const confirmed = window.confirm(
-    `将 ${ids.length} 个项目（约 ${formatBytes(size)}）移入 Windows 回收站。不会清空回收站，仍可恢复。确定继续吗？`,
-  );
-  if (!confirmed) return;
-  showToast("正在将选中项目移入回收站");
-  try {
-    const result = await invoke<CleanupRunResult>("clean_storage_items", { ids });
-    showToast(`已清理 ${result.cleanedCount} 项，释放约 ${formatBytes(result.reclaimedBytes)}`);
-    if (result.skipped.length) {
-      window.alert(`以下项目已安全跳过：\n${result.skipped.slice(0, 12).join("\n")}`);
-    }
-    await scanStorageCleanup(false);
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : String(error), true);
-  }
-});
+document.querySelector("#inspect-maintenance")?.addEventListener("click", () => void inspectMaintenance());
+document.querySelector("#scan-maintenance")?.addEventListener("click", () => void scanMaintenance());
 document.querySelector("#check-updates")?.addEventListener("click", async () => {
   showToast("正在检查新版本");
   try {
     state.update = await invoke<UpdateCheckResult>("check_for_updates");
+    state.updateError = "";
+    window.localStorage.setItem("devenv-last-update-check", String(Date.now()));
     renderUpdate();
     showToast(state.update.updateAvailable ? `发现新版本 ${state.update.latestVersion}` : "当前已是最新版本");
   } catch (error) {
-    showToast(error instanceof Error ? error.message : String(error), true);
+    state.updateError = error instanceof Error ? error.message : String(error);
+    renderUpdate();
+    showToast(state.updateError, true);
   }
 });
 document.querySelector("#auto-check-updates")?.addEventListener("change", (event) => {
@@ -2697,11 +2955,21 @@ document.querySelector("#run-command")?.addEventListener("click", async () => {
   const command = document.querySelector<HTMLInputElement>("#command-input")?.value || "";
   const cwd = document.querySelector<HTMLInputElement>("#command-cwd")?.value || "";
   const output = document.querySelector<HTMLElement>("#command-output");
-  showToast("正在运行命令");
   try {
+    const assessment = await invoke<CommandSafetyAssessment>("inspect_command_safety", { command });
+    if (!assessment.allowed) {
+      throw new Error(`安全模式已拦截：${assessment.reason}`);
+    }
+    let confirmed = false;
+    if (assessment.requiresConfirmation) {
+      confirmed = window.confirm(`${assessment.reason}\n\n命令：${command}\n\n确定继续吗？`);
+      if (!confirmed) return;
+    }
+    showToast(`正在运行白名单命令：${assessment.executable}`);
     const result = await invoke<CommandRunResult>("run_tool_command", {
       command,
       cwd: cwd || null,
+      confirmed,
     });
     if (output) {
       output.textContent = `退出码 ${result.returnCode} · ${result.elapsedMs} ms\n${result.output}`;
@@ -2755,14 +3023,6 @@ document.querySelector("#port-search")?.addEventListener("input", (event) => {
   renderPorts();
 });
 
-document.querySelector("#cleanup-architecture-result")?.addEventListener("change", (event) => {
-  const input = (event.target as HTMLElement).closest<HTMLInputElement>("input[data-cleanup-id]");
-  if (!input) return;
-  const id = input.dataset.cleanupId || "";
-  if (input.checked) state.cleanupSelected.add(id);
-  else state.cleanupSelected.delete(id);
-  renderCleanupArchitecture();
-});
 
 document.querySelector("#port-quick-filters")?.addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-port-filter]");
@@ -2850,16 +3110,6 @@ document.addEventListener("click", (event) => {
         showToast(error instanceof Error ? error.message : String(error), true);
       }
     })();
-  }
-  if (action === "cleanup-select-defaults") {
-    state.cleanupSelected = new Set(
-      state.cleanupReport?.candidates.filter((item) => item.selectedByDefault).map((item) => item.id) || [],
-    );
-    renderCleanupArchitecture();
-  }
-  if (action === "cleanup-clear-selection") {
-    state.cleanupSelected.clear();
-    renderCleanupArchitecture();
   }
   if (action === "update-project-port") {
     const configId = button.dataset.configId || "";
@@ -2968,6 +3218,9 @@ document.addEventListener("click", (event) => {
   if (action === "switch-jdk") {
     const version = button.dataset.version || "";
     const path = button.dataset.path || null;
+    const currentHome = state.javaEnvironment?.javaHome || state.env?.javaHome || "未设置";
+    const targetHome = path || `%DEVENV_HOME%\\current\\jdk（JDK ${version}）`;
+    if (!window.confirm(`将修改当前用户的 JDK 生效链：\n\nJAVA_HOME：${currentHome}\n→ ${targetHome}\n\n受管 PATH 中的 JDK 会保持在首位；切换后将自动验证 java、javac、Maven 与 Gradle。确定继续吗？`)) return;
     void runRuntimeOperation(
       () => invoke<OperationResult>("switch_runtime", { kind: "jdk", version, path }),
       `正在切换 JDK ${version}`,
@@ -3055,7 +3308,9 @@ document.addEventListener("click", (event) => {
   if (action === "uninstall-external-runtime") {
     const kind = button.dataset.kind || "";
     const executable = button.dataset.executable || "";
-    const ok = window.confirm(`将启动 Windows 卸载器来卸载 ${kind}。\n\n${executable}\n\n确定继续吗？`);
+    const source = button.dataset.source || "未知来源";
+    const method = source === "Scoop" || source === "Chocolatey" ? `调用 ${source} 的卸载流程` : "启动匹配的 Windows 卸载器";
+    const ok = window.confirm(`来源：${source}\n将${method}卸载 ${kind}。不会直接删除包管理器目录。\n\n${executable}\n\n确定继续吗？`);
     if (!ok) return;
     void runOperation(
       () => invoke<OperationResult>("uninstall_external_runtime", { kind, executable }),
@@ -3106,15 +3361,41 @@ document.addEventListener("click", (event) => {
 void listen<TaskProgress>("task-progress", (event) => renderProgress(event.payload));
 void refreshAll(false).then(() => {
   window.setTimeout(() => void refreshRuntimeAndPorts(true), 350);
+  window.setInterval(async () => {
+    try {
+      state.runtimes = await invoke<RuntimeInfo[]>("discover_runtimes");
+      renderRuntimes();
+    } catch {
+      // 实时版本刷新保持静默。
+    }
+  }, 30_000);
   if (state.config?.settings.autoCheckUpdate) {
-    window.setTimeout(async () => {
-      try {
-        state.update = await invoke<UpdateCheckResult>("check_for_updates");
-        renderUpdate();
-        if (state.update.updateAvailable) showToast(`发现新版本 ${state.update.latestVersion}`);
-      } catch {
-        // 启动检查保持静默，手动检查仍会显示具体错误。
-      }
-    }, 900);
+    const lastCheck = Number(window.localStorage.getItem("devenv-last-update-check") || 0);
+    if (Date.now() - lastCheck >= 24 * 60 * 60 * 1000) {
+      window.setTimeout(async () => {
+        try {
+          state.update = await invoke<UpdateCheckResult>("check_for_updates");
+          state.updateError = "";
+          window.localStorage.setItem("devenv-last-update-check", String(Date.now()));
+          renderUpdate();
+          if (state.update.updateAvailable) showToast(`发现新版本 ${state.update.latestVersion}`);
+        } catch (error) {
+          state.updateError = error instanceof Error ? error.message : String(error);
+          renderUpdate();
+        }
+      }, 1500);
+    }
+  }
+});
+document.querySelector("#inspect-java")?.addEventListener("click", () => void inspectJava());
+document.querySelector("#inspect-agent-traces")?.addEventListener("click", async () => {
+  const projectPath = document.querySelector<HTMLInputElement>("#project-path")?.value.trim() || null;
+  showToast("正在进行本地只读痕迹分析");
+  try {
+    state.agentTraces = await invoke<AgentTraceReport>("inspect_agent_traces", { projectPath });
+    renderAgentTraces();
+    showToast(`分析完成，发现 ${state.agentTraces.items.length} 条可验证线索`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
   }
 });

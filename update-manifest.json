@@ -1,12 +1,12 @@
 {
-  "version": "1.0.0",
-  "date": "2026-06-21",
+  "version": "1.1.0",
+  "date": "2026-06-23",
   "notes": [
-    "Python 改用完整 NuGet 发行包安装，可靠创建受管目录并验证 pip 与 venv",
-    "新增安全存储扫描、预览选择、回收站清理和操作历史",
-    "新增 devenv CLI、多 JDK 发行版、配置模板缺失版本补齐与环境医生安全修复",
-    "新增程序内校验更新、Docker/WSL 管理、数据库服务控制和项目端口配置"
+    "命令面板新增开发工具白名单、危险命令拦截和管理员态保护",
+    "新增 JAVA_HOME、PATH、java、javac、Maven、Gradle 一致性检查与 Nacos 启动修复",
+    "新增实时生效版本、页面使用说明、AI Agent/CLI 痕迹只读分析和低打扰更新检查",
+    "C 盘急救默认排除个人目录，新增 WPS 明确缓存/日志只读扫描"
   ],
-  "downloadUrl": "https://github.com/weidonglang/dailytools/releases/download/v1.0.0/DevEnv.Manager_1.0.0_x64-setup.exe",
-  "sha256": "d9a669a5baafbc6b3dcae8552adf1d337ed74447f1009b714232fabbba1355e7"
+  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.1.0/DevEnv.Manager_1.1.0_x64-setup.exe",
+  "sha256": "798bf54cb2545ab5e16d78a54591ce5ab56fee9659522c7c6ffdcf9f4efca414"
 }
