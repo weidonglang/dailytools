@@ -46,10 +46,40 @@ fn category(
         name: name.to_string(),
         description: description.to_string(),
         risk: risk.to_string(),
-        scan_only: true,
+        scan_only: !cleanable,
         cleanable,
         enabled_by_default: false,
         ..Default::default()
+    }
+}
+
+fn scan_managed_entries(
+    context: &mut ScanContext,
+    category: &mut CleanupCategoryScan,
+    root: &Path,
+    source: &str,
+    reason: &str,
+    old_only: bool,
+) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten().take(MAX_TEMP_ITEMS) {
+        let path = entry.path();
+        let recent = fs::symlink_metadata(&path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .is_some_and(|modified| is_recent(modified, now));
+        add_path_summary(
+            context,
+            category,
+            &path,
+            source,
+            reason,
+            !old_only || !recent,
+            (old_only && recent).then_some("24 小时内的日志受保护"),
+        );
     }
 }
 
@@ -269,8 +299,8 @@ fn add_common_cargo_targets(context: &mut ScanContext, category: &mut CleanupCat
                 &target,
                 "Cargo target",
                 "Rust 构建产物（仅常见项目目录）",
-                true,
-                None,
+                false,
+                Some("Cargo target 仅扫描；请在确认项目状态后由构建工具处理"),
             );
         }
     }
@@ -335,7 +365,7 @@ pub fn scan_cleanup_targets(managed_root: &Path) -> Result<CleanupScanReport, St
             "Thumbnail Cache",
             "thumbcache_",
             ".db",
-            "包含缩略图缓存，Phase 1 仅统计",
+            "包含缩略图缓存，始终只统计",
             "缩略图缓存仅统计",
         );
         add_path_summary(
@@ -385,23 +415,21 @@ pub fn scan_cleanup_targets(managed_root: &Path) -> Result<CleanupScanReport, St
         "medium",
         true,
     );
-    add_path_summary(
+    scan_managed_entries(
         &mut context,
         &mut devenv,
         &managed_root.join("downloads"),
         "DevEnv downloads",
         "已下载的安装缓存",
-        true,
-        None,
+        false,
     );
-    add_path_summary(
+    scan_managed_entries(
         &mut context,
         &mut devenv,
         &managed_root.join("logs"),
         "DevEnv logs",
-        "应用日志",
+        "超过 24 小时的旧日志",
         true,
-        None,
     );
     add_path_summary(
         &mut context,
@@ -429,7 +457,7 @@ pub fn scan_cleanup_targets(managed_root: &Path) -> Result<CleanupScanReport, St
         "开发缓存",
         "包管理器和构建工具可再生成缓存",
         "medium",
-        true,
+        false,
     );
     for (root, source) in developer_roots() {
         add_path_summary(
@@ -438,8 +466,8 @@ pub fn scan_cleanup_targets(managed_root: &Path) -> Result<CleanupScanReport, St
             &root,
             source,
             "开发工具可再生成缓存",
-            true,
-            None,
+            false,
+            Some("开发缓存请使用对应工具的官方清理命令"),
         );
     }
     add_common_cargo_targets(&mut context, &mut developer);
@@ -493,7 +521,10 @@ pub fn scan_cleanup_targets(managed_root: &Path) -> Result<CleanupScanReport, St
     ];
     let total_bytes = categories.iter().map(|item| item.total_bytes).sum();
     let total_items = categories.iter().map(|item| item.item_count).sum();
-    context.add_warning("Phase 1 为只读扫描：没有任何删除、移动或清空行为".to_string());
+    context.add_warning("Phase 2 仅允许清理明确选择且通过二次校验的低/中风险项目".to_string());
+    context.add_warning(
+        "Maven、Gradle、Cargo、Windows Temp、回收站、WPS 与系统缓存保持只读".to_string(),
+    );
     context.add_warning(
         "安全边界：默认扫描不会进入桌面、下载、文档、图片、视频或音乐目录".to_string(),
     );

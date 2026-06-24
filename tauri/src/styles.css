@@ -102,6 +102,189 @@ svg {
   gap: 6px;
 }
 
+.nav-group {
+  display: block;
+  margin: 12px 12px 4px;
+  color: #65727c;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 10px;
+  color: #65727c;
+  font-size: 12px;
+}
+
+.pagination button {
+  min-width: 72px;
+}
+
+.cleanup-modes,
+.dev-cache-actions {
+  margin: 12px 0;
+}
+
+.dev-cache-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.dev-cache-actions button {
+  text-align: left;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+}
+
+.expert-scan {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #d7dfe5;
+  border-radius: 12px;
+  background: #f8fafb;
+}
+
+.expert-scan summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.cleanup-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cleanup-plan-panel,
+.cleanup-result {
+  margin-top: 14px;
+}
+
+.cleanup-result.ok {
+  border-color: rgba(34, 197, 94, 0.35);
+}
+
+.cleanup-result.warn {
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.project-config-preview {
+  margin-top: 16px;
+}
+
+.project-config-files {
+  display: grid;
+  gap: 12px;
+}
+
+.project-config-file {
+  border: 1px solid #d7dfe5;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.project-config-file label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.project-config-file label span {
+  margin-left: auto;
+  color: #65727c;
+  font-size: 12px;
+}
+
+.project-config-file textarea {
+  width: 100%;
+  min-height: 150px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+}
+
+.runtime-switch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.runtime-switch-grid label {
+  display: grid;
+  gap: 5px;
+  color: #65727c;
+  font-size: 12px;
+}
+
+.line-item {
+  padding: 7px 9px;
+  border-bottom: 1px solid #d7dfe5;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+}
+
+.environment-preview {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #c8ddd5;
+  border-radius: 12px;
+  background: #f7fbf9;
+}
+
+.environment-preview code,
+.cleanup-result code {
+  overflow-wrap: anywhere;
+}
+
+.folder-usage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.folder-usage-card {
+  padding: 12px;
+  border: 1px solid #d7dfe5;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.folder-usage-card > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.folder-usage-card small {
+  display: block;
+  margin-top: 7px;
+  color: #65727c;
+}
+
+.maintenance-panel .form-row > span {
+  white-space: nowrap;
+  color: #65727c;
+}
+
+#large-file-min,
+#duplicate-min {
+  max-width: 110px;
+}
+
+#app-usage-result > section + section {
+  margin-top: 20px;
+}
+
 .nav-item {
   justify-content: flex-start;
   border-color: transparent;

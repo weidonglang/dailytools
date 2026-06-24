@@ -274,6 +274,27 @@ type ProjectAnalysis = {
   }>;
   warnings: string[];
 };
+type CurrentVersions = {
+  jdk?: string;
+  python?: string;
+  node?: string;
+  maven?: string;
+  gradle?: string;
+  go?: string;
+};
+type ProjectConfigFileDraft = {
+  relativePath: string;
+  content: string;
+  existed: boolean;
+  enabled: boolean;
+};
+type ProjectConfigPreview = {
+  projectPath: string;
+  detectedTypes: string[];
+  files: ProjectConfigFileDraft[];
+  current: CurrentVersions;
+  warnings: string[];
+};
 type ProjectPortConfig = {
   id: string;
   kind: string;
@@ -351,6 +372,7 @@ type PlatformReport = {
     cargoConfigPath: string;
     cargoConfigExists: boolean;
   };
+  chsrc: ToolState;
   generatedAt: string;
 };
 
@@ -479,6 +501,37 @@ type CleanupScanReport = {
   warnings: string[];
 };
 
+type CleanupPlan = {
+  planId: string;
+  createdAt: string;
+  selectedItems: Array<{
+    itemId: string;
+    path: string;
+    size: number;
+    categoryId: string;
+    risk: string;
+    action: string;
+    reversible: boolean;
+  }>;
+  estimatedBytes: number;
+  riskSummary: string[];
+  requiresAdmin: boolean;
+  warnings: string[];
+};
+
+type CleanupResult = {
+  planId: string;
+  startedAt: string;
+  finishedAt: string;
+  success: boolean;
+  cleanedBytes: number;
+  cleanedItems: number;
+  skippedItems: number;
+  failedItems: number;
+  failures: Array<{ path: string; reason: string }>;
+  reportMarkdown: string;
+};
+
 type DiskVolumeInfo = {
   drive: string;
   totalBytes: number;
@@ -525,14 +578,18 @@ app.innerHTML = `
         </div>
       </div>
       <nav class="nav">
+        <span class="nav-group">诊断</span>
         <button class="nav-item active" data-view="overview">${icon(Gauge)}<span>总览</span></button>
         <button class="nav-item" data-view="doctor">${icon(Shield)}<span>环境医生</span></button>
         <button class="nav-item" data-view="ports">${icon(Network)}<span>端口</span></button>
+        <span class="nav-group">环境与运行时</span>
         <button class="nav-item" data-view="runtimes">${icon(Terminal)}<span>版本管理</span></button>
         <button class="nav-item" data-view="environment">${icon(Route)}<span>环境</span></button>
+        <span class="nav-group">项目与生态</span>
         <button class="nav-item" data-view="project">${icon(FolderSearch)}<span>项目</span></button>
         <button class="nav-item" data-view="toolchains">${icon(PackageCheck)}<span>工具链</span></button>
         <button class="nav-item" data-view="platforms">${icon(Cpu)}<span>平台/镜像</span></button>
+        <span class="nav-group">维护与系统</span>
         <button class="nav-item" data-view="maintenance">${icon(Shield)}<span>C盘急救</span></button>
         <button class="nav-item" data-view="toolbox">${icon(Hammer)}<span>工具箱</span></button>
       </nav>
@@ -679,6 +736,7 @@ app.innerHTML = `
               <tbody id="ports-body"></tbody>
             </table>
           </div>
+          <div id="ports-pagination"></div>
           <div class="grid two port-insights">
             <section id="port-detail" class="port-detail"><div class="empty">点击详情按钮查看端口解释</div></section>
             <section>
@@ -762,13 +820,16 @@ app.innerHTML = `
           <section class="panel">
             <div class="panel-title">${icon(Route)}<h2>环境变量</h2></div>
             <div class="toolbar">
-              <button id="configure-env">${icon(Shield)}<span>配置</span></button>
+              <button id="configure-env">${icon(Shield)}<span>预览配置</span></button>
               <button id="check-env-health">${icon(Activity)}<span>检查</span></button>
               <button id="cleanup-path">${icon(Trash2)}<span>清理失效 PATH</span></button>
               <button id="restore-env">${icon(RefreshCw)}<span>恢复</span></button>
             </div>
             <div id="env-list" class="kv-list"></div>
             <div id="env-health" class="runtime-list health-list"></div>
+            <div id="env-config-preview"><div class="empty">点击“预览配置”查看 DEVENV_HOME、JAVA_HOME 和 PATH 的实际差异</div></div>
+            <div class="panel-head compact-title"><div class="panel-title">${icon(RefreshCw)}<h3>环境备份历史</h3></div><button id="load-env-backups">刷新备份</button></div>
+            <div id="env-backup-list" class="runtime-list"><div class="empty">尚未读取环境备份</div></div>
           </section>
           <section class="panel">
             <div class="panel-title">${icon(Shield)}<h2>配置模板</h2></div>
@@ -934,25 +995,54 @@ app.innerHTML = `
             <button id="open-package-mirrors">管理 npm / pip 源</button>
           </div>
         </section>
+        <section class="panel platform-section chsrc-section">
+          <div class="panel-head">
+            <div class="panel-title">${icon(RefreshCw)}<h2>chsrc 统一换源</h2></div>
+            <span id="chsrc-status" class="risk-chip">尚未检测</span>
+          </div>
+          <p class="small-note">调用官方 RubyMetric/chsrc，不在程序内重新实现换源；只接受固定目标和 chsrc 列出的源 ID，不接受自定义 URL。</p>
+          <div class="form-row">
+            <select id="chsrc-target">
+              <option value="node">Node.js</option><option value="python">Python</option>
+              <option value="go">Go</option><option value="rust">Rust</option>
+              <option value="cargo">Cargo</option><option value="maven">Maven</option>
+              <option value="gradle">Gradle</option><option value="nuget">NuGet</option>
+            </select>
+            <input id="chsrc-source" placeholder="源 ID，例如 tuna；自动测速可留空" />
+          </div>
+          <div class="toolbar">
+            <button data-chsrc-action="get">查看当前源</button>
+            <button data-chsrc-action="list">列出可用源</button>
+            <button data-chsrc-action="measure">测速</button>
+            <button data-chsrc-action="auto" class="primary">自动选择</button>
+            <button data-chsrc-action="set">使用源 ID</button>
+            <button data-chsrc-action="reset">恢复官方源</button>
+          </div>
+          <pre id="chsrc-output" class="command-output compact-output">安装提示：scoop install chsrc，或通过 WinGet 安装 RubyMetric/chsrc。</pre>
+        </section>
       </section>
 
       <section id="view-maintenance" class="view maintenance-view">
         <section class="maintenance-hero">
           <div>
-            <span class="phase-badge">Phase 1 · Scan only</span>
+            <span class="phase-badge">Phase 3 · Analyze & rescue</span>
             <h2>C 盘急救大师</h2>
-            <p>先看清空间去了哪里，再决定下一步。本阶段只读扫描，不删除、不移动、不修改任何文件。</p>
+            <p>严格执行扫描 → 选择 → 计划预览 → 二次确认 → 清理 → 验证 → 报告。普通文件优先移入 Windows 回收站。</p>
           </div>
           <div class="toolbar compact">
             <button id="inspect-maintenance" class="primary">${icon(Activity)}<span>开始体检</span></button>
-            <button id="scan-maintenance">${icon(Search)}<span>只读扫描</span></button>
+            <button id="scan-maintenance">${icon(Search)}<span>安全扫描</span></button>
           </div>
         </section>
         <nav class="maintenance-tabs" aria-label="C 盘急救功能">
           <button class="active" data-maintenance-tab="overview">总览</button>
           <button data-maintenance-tab="cleanup">C盘专清</button>
           <button data-maintenance-tab="dev-cache">开发缓存</button>
-          <button data-maintenance-tab="analysis">空间分析</button>
+          <button data-maintenance-tab="desktop">桌面急救</button>
+          <button data-maintenance-tab="downloads">下载目录</button>
+          <button data-maintenance-tab="large-files">大文件</button>
+          <button data-maintenance-tab="duplicates">重复文件</button>
+          <button data-maintenance-tab="apps">软件与应用</button>
           <button data-maintenance-tab="move">空间搬家</button>
           <button data-maintenance-tab="expand">扩容检测</button>
           <button data-maintenance-tab="startup">启动项/进程</button>
@@ -963,22 +1053,67 @@ app.innerHTML = `
           <div id="maintenance-overview"><div class="empty">点击“开始体检”读取 C 盘与各分区容量</div></div>
         </section>
         <section class="maintenance-panel" data-maintenance-panel="cleanup">
-          <div class="scan-only-banner">${icon(Shield)}<span>仅扫描：Windows Temp、回收站、错误报告和系统缓存都不会被清理。</span></div>
-          <div id="maintenance-cleanup-categories"><div class="empty">点击“只读扫描”生成真实扫描结果</div></div>
+          <div class="scan-only-banner">${icon(Shield)}<span>Windows Temp、回收站、Windows Update、Windows.old、个人目录、浏览器、微信/QQ 与系统缓存始终不会自动清理。</span></div>
+          <div class="toolbar cleanup-modes">
+            <button id="select-conservative">保守清理</button>
+            <button id="select-recommended">推荐清理</button>
+            <button id="clear-cleanup-selection">清空选择</button>
+            <button id="preview-cleanup-plan" class="primary" disabled>预览清理计划</button>
+          </div>
+          <div id="maintenance-cleanup-categories"><div class="empty">点击“安全扫描”生成真实扫描结果</div></div>
+          <details class="expert-scan">
+            <summary>专家扫描（默认折叠）</summary>
+            <p class="small-note">展示所有高风险与只读统计项。它们不会进入自动清理计划。</p>
+            <div id="maintenance-expert-categories"><div class="empty">扫描后显示系统与高风险分类</div></div>
+          </details>
+          <section id="cleanup-plan-preview" class="panel cleanup-plan-panel"><div class="empty">选择项目后点击“预览清理计划”</div></section>
+          <button id="execute-cleanup-plan" class="danger-button" disabled>${icon(Trash2)}<span>确认执行清理</span></button>
         </section>
         <section class="maintenance-panel" data-maintenance-panel="dev-cache">
-          <div class="scan-only-banner">${icon(Shield)}<span>仅扫描：npm、pnpm、Yarn、pip、uv、Poetry、Maven、Gradle、Cargo、Go 与 NuGet 缓存。</span></div>
-          <div id="maintenance-dev-categories"><div class="empty">点击“只读扫描”统计开发缓存</div></div>
+          <div class="scan-only-banner">${icon(Shield)}<span>开发缓存优先调用官方命令。Maven、Gradle、Cargo 和项目 target 只扫描，不默认清理。</span></div>
+          <div class="dev-cache-actions">
+            ${[
+              ["npm", "npm cache clean --force"], ["pnpm", "pnpm store prune"], ["yarn", "yarn cache clean"],
+              ["pip", "python -m pip cache purge"], ["uv", "uv cache clean"], ["poetry", "poetry cache clear pypi --all"],
+              ["go-cache", "go clean -cache"], ["go-modcache", "go clean -modcache"], ["dotnet", "dotnet nuget locals all --clear"],
+            ].map(([tool, command]) => `<button data-dev-cache="${tool}" title="${command}">${escapeHtml(command)}</button>`).join("")}
+          </div>
+          <div id="maintenance-dev-categories"><div class="empty">点击“安全扫描”统计开发缓存</div></div>
+        </section>
+        <section class="maintenance-panel" data-maintenance-panel="desktop">
+          <div class="panel-head"><div class="panel-title">${icon(FolderSearch)}<h2>桌面急救</h2></div><button id="inspect-desktop">只读分析桌面</button></div>
+          <div class="scan-only-banner">${icon(Shield)}<span>只统计占用并生成整理建议；不删除、不移动桌面文件，归档计划将在 Phase 4 执行。</span></div>
+          <div id="desktop-usage"><div class="empty">尚未分析桌面</div></div>
+        </section>
+        <section class="maintenance-panel" data-maintenance-panel="downloads">
+          <div class="panel-head"><div class="panel-title">${icon(Download)}<h2>下载目录</h2></div><button id="inspect-downloads">只读分析下载目录</button></div>
+          <div class="scan-only-banner">${icon(Shield)}<span>分类安装包、压缩包、视频、图片、文档、镜像、旧文件和大文件；本阶段不移动、不删除。</span></div>
+          <div id="downloads-usage"><div class="empty">尚未分析下载目录</div></div>
+        </section>
+        <section class="maintenance-panel" data-maintenance-panel="large-files">
+          <div class="panel-head"><div class="panel-title">${icon(Search)}<h2>大文件 Top 100</h2></div><button id="scan-large-files">开始只读扫描</button></div>
+          <div class="form-row"><input id="large-file-root" placeholder="扫描目录；留空使用用户目录" /><input id="large-file-min" type="number" min="1" value="100" title="最小 MB" /><span>MB 以上</span></div>
+          <div id="large-file-result" class="runtime-list"><div class="empty">选择或填写扫描范围后开始</div></div>
+        </section>
+        <section class="maintenance-panel" data-maintenance-panel="duplicates">
+          <div class="panel-head"><div class="panel-title">${icon(Boxes)}<h2>重复文件</h2></div><button id="scan-duplicates">按大小与 SHA256 扫描</button></div>
+          <div class="scan-only-banner">${icon(Shield)}<span>只扫描用户明确选择的目录；先按大小分组，再读取候选内容计算 SHA256。不提供删除。</span></div>
+          <div class="form-row"><input id="duplicate-root" placeholder="扫描目录；留空使用用户目录" /><input id="duplicate-min" type="number" min="1" value="10" title="最小 MB" /><span>MB 以上</span></div>
+          <div id="duplicate-result"><div class="empty">尚未扫描重复文件</div></div>
+        </section>
+        <section class="maintenance-panel" data-maintenance-panel="apps">
+          <div class="panel-head"><div class="panel-title">${icon(Database)}<h2>软件与常见应用占用</h2></div><button id="inspect-app-usage">开始只读分析</button></div>
+          <div class="scan-only-banner">${icon(Shield)}<span>微信/QQ 不读取聊天数据库；浏览器不扫描 Cookie、密码和登录态；软件与游戏不直接删除安装目录。</span></div>
+          <div id="app-usage-result"><div class="empty">尚未分析常见应用与已安装软件</div></div>
         </section>
         ${[
-          ["analysis", "空间分析", "大文件明细与目录树将在后续阶段开放。"],
           ["move", "空间搬家", "后续阶段会提供可预览、可回滚的目录迁移。"],
           ["expand", "扩容检测", "后续阶段会检测分区布局与可扩容条件。"],
-          ["startup", "启动项/进程", "Phase 1 仅在总览统计启动目录项目数量。"],
-          ["report", "报告", "后续阶段会支持导出体检与执行记录。"],
+          ["startup", "启动项/进程", "当前版本仅在总览统计启动目录项目数量。"],
+          ["report", "报告", "清理完成后会在这里显示结果。"],
         ].map(([id, title, text]) => `
           <section class="maintenance-panel" data-maintenance-panel="${id}">
-            <div class="panel maintenance-placeholder"><h2>${title}</h2><p>${text}</p><span>Phase 1 暂未开放</span></div>
+            <div class="panel maintenance-placeholder"><h2>${title}</h2><p>${text}</p><span>${id === "report" ? "等待清理结果" : "后续阶段开放"}</span>${id === "report" ? `<div id="cleanup-report"><div class="empty">尚无清理报告</div></div>` : ""}</div>
           </section>
         `).join("")}
       </section>
@@ -1081,8 +1216,9 @@ app.innerHTML = `
             <button id="check-project">${icon(Play)}<span>分析</span></button>
           </div>
           <div class="toolbar project-actions">
-            <button id="generate-vscode">${icon(Hammer)}<span>生成 VS Code 配置</span></button>
+            <button id="preview-project-config">${icon(Hammer)}<span>生成 VS Code / IDEA 配置预览</span></button>
           </div>
+          <section id="project-config-preview" class="project-config-preview"><div class="empty">先分析项目，再生成可编辑的配置预览</div></section>
           <div id="project-health" class="project-health"></div>
           <pre id="project-output" class="command-output"></pre>
         </section>
@@ -1098,6 +1234,8 @@ app.innerHTML = `
 const state = {
   snapshot: null as AppSnapshot | null,
   env: null as EnvSnapshot | null,
+  environmentPreview: null as EnvironmentConfigPreview | null,
+  environmentBackups: [] as EnvironmentBackupInfo[],
   config: null as ConfigView | null,
   runtimes: [] as RuntimeInfo[],
   javaEnvironment: null as JavaEnvironmentReport | null,
@@ -1112,6 +1250,7 @@ const state = {
   doctor: null as DoctorReport | null,
   python: null as PythonAnalysis | null,
   project: null as ProjectAnalysis | null,
+  projectConfigPreview: null as ProjectConfigPreview | null,
   toolchains: null as ToolchainReport | null,
   platforms: null as PlatformReport | null,
   projectPorts: [] as ProjectPortConfig[],
@@ -1124,8 +1263,108 @@ const state = {
   agentTraces: null as AgentTraceReport | null,
   cleanupArchitecture: null as CleanupArchitecture | null,
   cleanupReport: null as CleanupScanReport | null,
+  cleanupSelection: new Set<string>(),
+  cleanupPlan: null as CleanupPlan | null,
+  cleanupResult: null as CleanupResult | null,
   maintenanceOverview: null as MaintenanceOverview | null,
+  desktopUsage: null as FolderUsageReport | null,
+  downloadsUsage: null as FolderUsageReport | null,
+  largeFiles: [] as LargeFileItem[],
+  duplicateGroups: [] as DuplicateGroup[],
+  appUsage: null as AppUsageReport | null,
 };
+
+type LargeFileItem = {
+  path: string;
+  size: number;
+  modifiedAt?: string;
+  fileType: string;
+  suggestion: string;
+  risk: string;
+};
+
+type DuplicateGroup = {
+  size: number;
+  hash: string;
+  files: Array<{ path: string; modifiedAt?: string; keepSuggestion: string }>;
+  reclaimableEstimate: number;
+};
+
+type FolderUsageReport = {
+  name: string;
+  path: string;
+  totalBytes: number;
+  categories: Array<{ name: string; path: string; size: number; category: string; suggestion: string }>;
+  suggestions: string[];
+  warnings: string[];
+};
+
+type InstalledSoftwareUsage = {
+  name: string;
+  publisher: string;
+  installLocation: string;
+  estimatedSize: number;
+  uninstallCommandExists: boolean;
+  suggestion: string;
+};
+
+type AppUsageItem = {
+  name: string;
+  detected: boolean;
+  path: string;
+  size: number;
+  categories: FolderUsageReport["categories"];
+  safeActions: string[];
+  warnings: string[];
+};
+
+type AppUsageReport = {
+  wechat?: AppUsageItem;
+  qq?: AppUsageItem;
+  browsers: AppUsageItem[];
+  netDisks: AppUsageItem[];
+  videoEditors: AppUsageItem[];
+  gamePlatforms: AppUsageItem[];
+  installedSoftware: InstalledSoftwareUsage[];
+};
+
+type EnvironmentConfigPreview = {
+  previewId: string;
+  createdAt: string;
+  changes: Array<{ name: string; current: string; proposed: string; impact: string }>;
+  pathAdded: string[];
+  pathRemoved: string[];
+  warnings: string[];
+  backupName: string;
+};
+
+type EnvironmentBackupInfo = {
+  fileName: string;
+  createdAt: string;
+  devenvHome: string;
+  javaHome: string;
+  pathEntries: number;
+};
+
+const paginationState = new Map<string, number>();
+const PAGE_SIZE = 5;
+
+function paginate<T>(key: string, items: T[], render: (item: T) => string, pageSize = PAGE_SIZE) {
+  if (items.length <= pageSize) return items.map(render).join("");
+  const pages = Math.ceil(items.length / pageSize);
+  const page = Math.min(Math.max(1, paginationState.get(key) || 1), pages);
+  paginationState.set(key, page);
+  const content = items.slice((page - 1) * pageSize, page * pageSize).map(render).join("");
+  return `${content}<nav class="pagination" aria-label="分页"><button data-page-key="${escapeHtml(key)}" data-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>上一页</button><span>${page} / ${pages} · 共 ${items.length} 项</span><button data-page-key="${escapeHtml(key)}" data-page="${page + 1}" ${page >= pages ? "disabled" : ""}>下一页</button></nav>`;
+}
+
+function paginationControls(key: string, count: number, pageSize = PAGE_SIZE) {
+  if (count <= pageSize) return "";
+  const pages = Math.ceil(count / pageSize);
+  const page = Math.min(Math.max(1, paginationState.get(key) || 1), pages);
+  paginationState.set(key, page);
+  return `<nav class="pagination" aria-label="分页"><button data-page-key="${escapeHtml(key)}" data-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>上一页</button><span>${page} / ${pages} · 共 ${count} 项</span><button data-page-key="${escapeHtml(key)}" data-page="${page + 1}" ${page >= pages ? "disabled" : ""}>下一页</button></nav>`;
+}
 
 const portState = {
   sortKey: "localPort" as PortSortKey,
@@ -1256,12 +1495,10 @@ function renderEnv() {
   const warnings = document.querySelector<HTMLElement>("#path-warnings");
   if (!warnings) return;
   warnings.innerHTML = state.env.pathWarnings.length
-    ? state.env.pathWarnings
-        .map((item) => {
+    ? paginate("path-warnings", state.env.pathWarnings, (item) => {
           const kind = item.startsWith("托管 PATH") ? "pending" : item.startsWith("重复 PATH") ? "duplicate" : "invalid";
           return `<div class="warning ${kind}">${escapeHtml(item)}</div>`;
         })
-        .join("")
     : `<div class="empty">当前进程 PATH 没有发现重复或失效条目</div>`;
 }
 
@@ -1271,17 +1508,14 @@ function renderRuntimes() {
   const element = document.querySelector<HTMLElement>("#runtime-list");
   if (!element) return;
   element.innerHTML = state.runtimes.length
-    ? state.runtimes
-        .map(
+    ? paginate("runtime-list", state.runtimes,
           (runtime) => `
             <article class="runtime">
               <div><strong>${escapeHtml(runtime.kind)}</strong><span>${escapeHtml(runtime.version)}</span></div>
               <small>${escapeHtml(runtime.source)} · ${escapeHtml(runtime.executable)}</small>
               ${canUninstallExternal(runtime) ? `<div class="row-actions"><button data-action="uninstall-external-runtime" data-kind="${escapeHtml(runtime.kind)}" data-source="${escapeHtml(runtime.source)}" data-executable="${escapeHtml(runtime.executable)}">${icon(Trash2)}<span>${runtime.source === "Scoop" || runtime.source === "Chocolatey" ? "用包管理器卸载" : "系统卸载"}</span></button></div>` : ""}
             </article>
-          `,
-        )
-        .join("")
+          `)
     : `<div class="empty">还没有发现开发工具</div>`;
   renderManagedJdks();
   renderManagedNodes();
@@ -1347,8 +1581,7 @@ function renderManagedJdks() {
   const jdks = state.config?.installed.jdks || [];
   const current = state.config?.installed.current.jdk;
   element.innerHTML = jdks.length
-    ? jdks
-        .map(
+    ? paginate("managed-jdks", jdks,
           (jdk) => `
             <article class="runtime managed-runtime">
               <div>
@@ -1361,9 +1594,7 @@ function renderManagedJdks() {
                 <button data-action="uninstall-jdk" data-version="${escapeHtml(jdk.version)}" data-path="${escapeHtml(jdk.path)}">${icon(Trash2)}<span>卸载</span></button>
               </div>
             </article>
-          `,
-        )
-        .join("")
+          `)
     : `<div class="empty">还没有安装受管 JDK</div>`;
 }
 
@@ -1373,8 +1604,7 @@ function renderManagedNodes() {
   const nodes = state.config?.installed.nodes || [];
   const current = state.config?.installed.current.node;
   element.innerHTML = nodes.length
-    ? nodes
-        .map(
+    ? paginate("managed-nodes", nodes,
           (node) => `
             <article class="runtime managed-runtime">
               <div>
@@ -1387,9 +1617,7 @@ function renderManagedNodes() {
                 <button data-action="uninstall-node" data-version="${escapeHtml(node.version)}" data-path="${escapeHtml(node.path)}">${icon(Trash2)}<span>卸载</span></button>
               </div>
             </article>
-          `,
-        )
-        .join("")
+          `)
     : `<div class="empty">还没有安装受管 Node.js</div>`;
 }
 
@@ -1399,8 +1627,7 @@ function renderManagedPythons() {
   const pythons = state.config?.installed.pythons || [];
   const current = state.config?.installed.current.python;
   element.innerHTML = pythons.length
-    ? pythons
-        .map(
+    ? paginate("managed-pythons", pythons,
           (python) => `
             <article class="runtime managed-runtime">
               <div>
@@ -1413,9 +1640,7 @@ function renderManagedPythons() {
                 <button data-action="uninstall-python" data-version="${escapeHtml(python.version)}" data-path="${escapeHtml(python.path)}">${icon(Trash2)}<span>卸载</span></button>
               </div>
             </article>
-          `,
-        )
-        .join("")
+          `)
     : `<div class="empty">还没有安装受管 Python</div>`;
 }
 
@@ -1428,8 +1653,7 @@ function renderManagedBuildTools() {
   ];
   const current = state.config?.installed.current || {};
   element.innerHTML = items.length
-    ? items
-        .map(
+    ? paginate("managed-build-tools", items,
           (item) => `
             <article class="runtime managed-runtime">
               <div>
@@ -1442,9 +1666,7 @@ function renderManagedBuildTools() {
                 <button data-action="uninstall-build-tool" data-kind="${item.kind}" data-version="${escapeHtml(item.version)}" data-path="${escapeHtml(item.path)}">${icon(Trash2)}<span>卸载</span></button>
               </div>
             </article>
-          `,
-        )
-        .join("")
+          `)
     : `<div class="empty">还没有安装受管 Maven 或 Gradle</div>`;
 }
 
@@ -1465,8 +1687,7 @@ function renderManagedGos() {
   const gos = state.config?.installed.gos || [];
   const current = state.config?.installed.current.go;
   element.innerHTML = gos.length
-    ? gos
-        .map(
+    ? paginate("managed-gos", gos,
           (go) => `
             <article class="runtime managed-runtime">
               <div>
@@ -1479,9 +1700,7 @@ function renderManagedGos() {
                 <button data-action="uninstall-go" data-version="${escapeHtml(go.version)}" data-path="${escapeHtml(go.path)}">${icon(Trash2)}<span>卸载</span></button>
               </div>
             </article>
-          `,
-        )
-        .join("")
+          `)
     : `<div class="empty">还没有安装受管 Go</div>`;
 }
 
@@ -1490,8 +1709,12 @@ function renderPorts() {
   setText("metric-ports", visible.length);
   const body = document.querySelector<HTMLElement>("#ports-body");
   if (!body) return;
+  const pageSize = 10;
+  const pages = Math.max(1, Math.ceil(visible.length / pageSize));
+  const page = Math.min(Math.max(1, paginationState.get("ports") || 1), pages);
+  paginationState.set("ports", page);
   body.innerHTML = visible
-    .slice(0, 250)
+    .slice((page - 1) * pageSize, page * pageSize)
     .map(
       (record) => {
         const hint = portHint(record);
@@ -1510,6 +1733,8 @@ function renderPorts() {
       },
     )
     .join("");
+  const pager = document.querySelector<HTMLElement>("#ports-pagination");
+  if (pager) pager.innerHTML = paginationControls("ports", visible.length, pageSize);
   updateSortHeaders();
   renderPortDetails();
   renderPortHistory();
@@ -1547,17 +1772,13 @@ function renderPortHistory() {
   const element = document.querySelector<HTMLElement>("#port-history");
   if (!element) return;
   element.innerHTML = state.portHistory.length
-    ? state.portHistory
-        .slice(0, 12)
-        .map(
+    ? paginate("port-history", state.portHistory,
           (item) => `
             <article class="runtime">
               <div><strong>${item.port} · ${escapeHtml(item.processName)}</strong><span>${item.observations} 次</span></div>
               <small>最近记录：${new Date(item.lastSeen * 1000).toLocaleString("zh-CN")}</small>
             </article>
-          `,
-        )
-        .join("")
+          `)
     : `<div class="empty">还没有端口历史</div>`;
 }
 
@@ -1573,16 +1794,13 @@ function renderHealth() {
   const element = document.querySelector<HTMLElement>("#env-health");
   if (!element) return;
   element.innerHTML = state.health.length
-    ? state.health
-        .map(
+    ? paginate("env-health", state.health,
           (item) => `
             <article class="runtime health-item ${item.status === "正常" ? "ok" : "warn"}">
               <div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.status)}</span></div>
               <small>${escapeHtml(item.detail)}</small>
             </article>
-          `,
-        )
-        .join("")
+          `)
     : `<div class="empty">还没有环境健康检查结果</div>`;
 }
 
@@ -1590,8 +1808,7 @@ function renderProfiles() {
   const element = document.querySelector<HTMLElement>("#profile-list");
   if (!element) return;
   element.innerHTML = state.profiles.length
-    ? state.profiles
-        .map((profile) => {
+    ? paginate("profiles", state.profiles, (profile) => {
           const current = Object.entries(profile.current)
             .filter(([, value]) => value)
             .map(([key, value]) => `${key} ${value}`)
@@ -1608,7 +1825,6 @@ function renderProfiles() {
             </article>
           `;
         })
-        .join("")
     : `<div class="empty">还没有保存配置模板</div>`;
 }
 
@@ -1848,8 +2064,13 @@ function renderPlatforms() {
   const rust = document.querySelector<HTMLElement>("#rust-platform");
   const dotnet = document.querySelector<HTMLElement>("#dotnet-platform");
   const mirrors = document.querySelector<HTMLElement>("#mirror-platform");
+  const chsrc = document.querySelector<HTMLElement>("#chsrc-status");
   const report = state.platforms;
   if (!go || !rust || !dotnet || !mirrors || !report) return;
+  if (chsrc) {
+    chsrc.textContent = report.chsrc.installed ? `已安装 · ${report.chsrc.version}` : "未安装";
+    chsrc.className = `risk-chip ${report.chsrc.installed ? "risk-low" : "risk-medium"}`;
+  }
 
   go.innerHTML = `
     <div class="tool-state-grid">${renderToolStates([report.go.go])}</div>
@@ -1867,13 +2088,13 @@ function renderPlatforms() {
       <div><span>MSVC Build Tools</span><strong>${escapeHtml(report.rust.msvcBuildTools)}</strong></div>
       <div><span>Cargo 配置</span><strong>${escapeHtml(report.rust.cargoConfigPath)}</strong></div>
     </div>
-    <div class="chip-row">${report.rust.installedToolchains.map((item) => `<span>${escapeHtml(item)}</span>`).join("") || ""}</div>
+    <div class="chip-row">${paginate("rust-toolchains", report.rust.installedToolchains, (item) => `<span>${escapeHtml(item)}</span>`) || ""}</div>
   `;
   dotnet.innerHTML = `
     <div class="tool-state-grid">${renderToolStates([report.dotnet.dotnet])}</div>
     <div class="platform-columns">
-      <div><h3>SDK</h3><pre class="command-output compact-output">${escapeHtml(report.dotnet.sdks.join("\n") || "未发现 SDK")}</pre></div>
-      <div><h3>Runtime</h3><pre class="command-output compact-output">${escapeHtml(report.dotnet.runtimes.join("\n") || "未发现 Runtime")}</pre></div>
+      <div><h3>SDK</h3><div class="runtime-list">${paginate("dotnet-sdks", report.dotnet.sdks, (item) => `<div class="line-item">${escapeHtml(item)}</div>`) || "未发现 SDK"}</div></div>
+      <div><h3>Runtime</h3><div class="runtime-list">${paginate("dotnet-runtimes", report.dotnet.runtimes, (item) => `<div class="line-item">${escapeHtml(item)}</div>`) || "未发现 Runtime"}</div></div>
     </div>
   `;
   mirrors.innerHTML = `
@@ -2005,37 +2226,31 @@ function renderProjectAnalysis(analysis: ProjectAnalysis) {
       <strong>${escapeHtml(analysis.root)}</strong>
       <span>${analysis.projectTypes.length ? analysis.projectTypes.join(" / ") : "未识别项目类型"}</span>
     </div>
-    <div class="chip-row">${analysis.detectedFiles.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
+    <div class="chip-row">${paginate("project-signals", analysis.detectedFiles, (item) => `<span>${escapeHtml(item)}</span>`)}</div>
     <div class="grid two compact-grid">
       <section>
         <h3>推荐环境</h3>
         <div class="runtime-list">
-          ${analysis.recommendedRuntime
-            .map(
+          ${paginate("project-runtimes", analysis.recommendedRuntime,
               (item) => `
                 <article class="runtime">
                   <div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.status)}</span></div>
                   <small>${escapeHtml(item.requirement)}</small>
                 </article>
-              `,
-            )
-            .join("") || `<div class="empty">没有特殊版本要求</div>`}
+              `) || `<div class="empty">没有特殊版本要求</div>`}
         </div>
       </section>
       <section>
         <h3>建议操作</h3>
         <div class="runtime-list">
-          ${analysis.actions
-            .map(
+          ${paginate("project-actions", analysis.actions,
               (item) => `
                 <article class="runtime project-action-item">
                   <div><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.command)}</span></div>
                   <small>${escapeHtml(item.description)}</small>
                   <button data-action="project-run" data-project-action="${escapeHtml(item.id)}">${item.id === "copy_commands" ? icon(Clipboard) : icon(Play)}<span>${item.id === "copy_commands" ? "复制" : "运行"}</span></button>
                 </article>
-              `,
-            )
-            .join("")}
+              `)}
         </div>
       </section>
     </div>
@@ -2047,7 +2262,7 @@ function renderProjectPortConfigs() {
   const element = document.querySelector<HTMLElement>("#project-port-configs");
   if (!element) return;
   element.innerHTML = state.projectPorts.length
-    ? state.projectPorts.map((config) => `
+    ? paginate("project-ports", state.projectPorts, (config) => `
         <article class="runtime project-port-item">
           <div><strong>${escapeHtml(config.description)}</strong><span>当前 ${config.currentPort}</span></div>
           <small>${escapeHtml(config.file)}${config.line ? ` · 第 ${config.line} 行` : " · 将创建配置"}</small>
@@ -2056,7 +2271,7 @@ function renderProjectPortConfigs() {
             <button data-action="update-project-port" data-config-id="${escapeHtml(config.id)}">${icon(RefreshCw)}<span>备份并修改</span></button>
           </div>
         </article>
-      `).join("")
+      `)
     : `<div class="empty">没有发现可修改的 Spring Boot、Tomcat、Vite 或 .env 端口配置</div>`;
 }
 
@@ -2074,13 +2289,14 @@ async function inspectProjectPorts(showProgress = true) {
 }
 
 async function refreshBase() {
-  const [snapshot, config, envSnapshot, profiles, jdkDistributions, cleanupArchitecture] = await Promise.all([
+  const [snapshot, config, envSnapshot, profiles, jdkDistributions, cleanupArchitecture, environmentBackups] = await Promise.all([
     invoke<AppSnapshot>("app_snapshot"),
     invoke<ConfigView>("load_config"),
     invoke<EnvSnapshot>("env_snapshot"),
     invoke<ConfigProfile[]>("list_config_profiles"),
     invoke<JdkDistribution[]>("jdk_distributions"),
     invoke<CleanupArchitecture>("storage_cleanup_architecture"),
+    invoke<EnvironmentBackupInfo[]>("list_environment_backups"),
   ]);
 
   state.snapshot = snapshot;
@@ -2089,8 +2305,11 @@ async function refreshBase() {
   state.profiles = profiles;
   state.jdkDistributions = jdkDistributions;
   state.cleanupArchitecture = cleanupArchitecture;
+  state.environmentBackups = environmentBackups;
   renderSnapshot();
   renderEnv();
+  renderEnvironmentPreview();
+  renderEnvironmentBackups();
   renderHealth();
   renderProfiles();
   renderProfileImportPreview();
@@ -2103,6 +2322,14 @@ async function refreshBase() {
   renderUpdate();
   renderMaintenanceOverview();
   renderMaintenanceScan();
+  renderCleanupPlan();
+  renderCleanupResult();
+  renderProjectConfigPreview();
+  renderFolderUsage("#desktop-usage", state.desktopUsage, "desktop-usage");
+  renderFolderUsage("#downloads-usage", state.downloadsUsage, "downloads-usage");
+  renderLargeFiles();
+  renderDuplicates();
+  renderAppUsage();
   renderPorts();
   const autoCheckUpdates = document.querySelector<HTMLInputElement>("#auto-check-updates");
   if (autoCheckUpdates) autoCheckUpdates.checked = config.settings.autoCheckUpdate;
@@ -2320,7 +2547,7 @@ function renderSystemPlatforms() {
       <div><span>WSL 状态</span><strong>${escapeHtml(report.wslStatus || "未读取")}</strong></div>
     </div>
     <div class="runtime-list wsl-list">
-      ${report.wslItems.map((item) => `
+      ${paginate("wsl-items", report.wslItems, (item) => `
         <article class="runtime">
           <div><strong>${escapeHtml(item.name)}</strong><span>${item.isDefault ? "默认 · " : ""}${escapeHtml(item.state)} · WSL ${escapeHtml(item.version)}</span></div>
           <div class="row-actions">
@@ -2329,7 +2556,7 @@ function renderSystemPlatforms() {
             <button data-action="system-platform" data-platform-action="wsl_terminate" data-platform-value="${escapeHtml(item.name)}">${icon(Trash2)}<span>终止</span></button>
           </div>
         </article>
-      `).join("") || `<div class="empty">没有发现 WSL 发行版</div>`}
+      `) || `<div class="empty">没有发现 WSL 发行版</div>`}
     </div>
   `;
 }
@@ -2338,8 +2565,7 @@ function renderLocalServices() {
   const element = document.querySelector<HTMLElement>("#local-service-result");
   if (!element) return;
   element.innerHTML = state.localServices.length
-    ? state.localServices
-        .map(
+    ? paginate("local-services", state.localServices,
           (service) => `
             <article class="runtime ${service.occupied ? "warn" : service.installed ? "ok" : ""}">
               <div>
@@ -2358,9 +2584,7 @@ function renderLocalServices() {
                 ` : ""}
               </div>
             </article>
-          `,
-        )
-        .join("")
+          `)
     : `<div class="empty">尚未检查常见开发服务</div>`;
 }
 
@@ -2391,16 +2615,13 @@ function renderCache() {
   const element = document.querySelector<HTMLElement>("#cache-list");
   if (!element) return;
   element.innerHTML = state.cache.length
-    ? state.cache
-        .map(
+    ? paginate("download-cache", state.cache,
           (item) => `
             <article class="runtime">
               <div><strong>${escapeHtml(item.name)}</strong><span>${formatBytes(item.size)}</span></div>
               <small>${escapeHtml(item.sha256 || item.path)}</small>
             </article>
-          `,
-        )
-        .join("")
+          `)
     : `<div class="empty">下载缓存为空</div>`;
 }
 
@@ -2439,14 +2660,14 @@ function renderAgentTraces() {
   element.innerHTML = `
     <div class="privacy-notice">${icon(Shield)}<span>${escapeHtml(report.privacyNotice)}</span></div>
     <div class="runtime-list agent-trace-list">
-      ${report.items.map((item) => `
+      ${paginate("agent-traces", report.items, (item) => `
         <article class="runtime">
           <div><strong>${escapeHtml(item.source)}</strong><span>置信度：${escapeHtml(item.confidence)}</span></div>
           <small>${escapeHtml(item.path)}</small>
           <small>${escapeHtml(item.evidence)}</small>
           <small>${escapeHtml(item.recommendation)}</small>
         </article>
-      `).join("") || `<div class="empty">没有发现可验证的 Agent / CLI 安装痕迹</div>`}
+      `) || `<div class="empty">没有发现可验证的 Agent / CLI 安装痕迹</div>`}
     </div>
     <ul>${report.limitations.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
   `;
@@ -2463,7 +2684,7 @@ function renderMaintenanceOverview() {
         <span>C 盘剩余</span><strong>${formatBytes(cDrive.freeBytes || 0)}</strong>
         <small>${cDrive.totalBytes ? `已用 ${cDrive.usedPercent.toFixed(1)}%` : "未识别 C 盘"} · ${riskText(overview.riskLevel)}风险</small>
       </article>
-      <article class="maintenance-metric"><span>可清理空间估算</span><strong>${formatBytes(overview.safeCleanEstimate)}</strong><small>仅估算，本阶段不执行</small></article>
+      <article class="maintenance-metric"><span>可清理空间估算</span><strong>${formatBytes(overview.safeCleanEstimate)}</strong><small>需扫描、选择并确认计划</small></article>
       <article class="maintenance-metric"><span>开发缓存</span><strong>${formatBytes(overview.devCacheEstimate)}</strong><small>包管理器与构建缓存</small></article>
       <article class="maintenance-metric protected"><span>个人目录</span><strong>默认排除</strong><small>桌面、下载、文档、图片、视频、音乐均不进入扫描</small></article>
     </div>
@@ -2493,14 +2714,14 @@ function renderMaintenanceOverview() {
   `;
 }
 
-function renderScanCategories(target: string, categoryIds: string[]) {
+function renderScanCategories(target: string, categoryIds: string[], selectable = false) {
   const element = document.querySelector<HTMLElement>(target);
   if (!element) return;
   const report = state.cleanupReport;
   if (!report) return;
   const categories = report.categories.filter((category) => categoryIds.includes(category.id));
   element.innerHTML = `
-    <div class="scan-summary"><strong>${formatBytes(categories.reduce((sum, item) => sum + item.totalBytes, 0))}</strong><span>${categories.reduce((sum, item) => sum + item.itemCount, 0)} 个只读统计项</span></div>
+    <div class="scan-summary"><strong>${formatBytes(categories.reduce((sum, item) => sum + item.totalBytes, 0))}</strong><span>${categories.reduce((sum, item) => sum + item.itemCount, 0)} 个扫描项</span></div>
     <div class="maintenance-category-list">
       ${categories.map((category) => `
         <details class="maintenance-category" ${category.totalBytes ? "open" : ""}>
@@ -2509,13 +2730,13 @@ function renderScanCategories(target: string, categoryIds: string[]) {
             <span><b>${formatBytes(category.totalBytes)}</b><i class="risk-chip risk-${escapeHtml(category.risk)}">${riskText(category.risk)}风险</i></span>
           </summary>
           <div class="maintenance-items">
-            ${category.items.map((item) => `
+            ${paginate(`cleanup-${target}-${category.id}`, category.items, (item) => `
               <article class="maintenance-item">
-                <div><strong>${escapeHtml(item.source)}</strong><span>${formatBytes(item.size)}</span></div>
+                <div>${selectable && item.cleanable ? `<label class="cleanup-check"><input type="checkbox" data-cleanup-item="${escapeHtml(item.id)}" ${state.cleanupSelection.has(item.id) ? "checked" : ""} /><strong>${escapeHtml(item.source)}</strong></label>` : `<strong>${escapeHtml(item.source)}</strong>`}<span>${formatBytes(item.size)}</span></div>
                 <small>${escapeHtml(item.path)}</small>
-                <small>${escapeHtml(item.skippedReason || item.reason)} · ${item.cleanable ? "未来可评估清理" : "受保护 / 仅统计"}</small>
+                <small>${escapeHtml(item.skippedReason || item.reason)} · ${item.cleanable ? "可加入清理计划" : "只读扫描，不建议自动清理"}</small>
               </article>
-            `).join("") || `<div class="empty">目录不存在或占用为 0</div>`}
+            `) || `<div class="empty">目录不存在或占用为 0</div>`}
           </div>
         </details>
       `).join("")}
@@ -2525,8 +2746,131 @@ function renderScanCategories(target: string, categoryIds: string[]) {
 }
 
 function renderMaintenanceScan() {
-  renderScanCategories("#maintenance-cleanup-categories", ["windows-temp", "system-caches", "recycle-bin", "devenv-manager", "wps-cache"]);
+  renderScanCategories("#maintenance-cleanup-categories", ["windows-temp", "devenv-manager"], true);
+  renderScanCategories("#maintenance-expert-categories", ["system-caches", "recycle-bin", "wps-cache"]);
   renderScanCategories("#maintenance-dev-categories", ["developer-caches"]);
+  const preview = document.querySelector<HTMLButtonElement>("#preview-cleanup-plan");
+  if (preview) preview.disabled = state.cleanupSelection.size === 0;
+}
+
+function renderEnvironmentPreview() {
+  const element = document.querySelector<HTMLElement>("#env-config-preview");
+  const preview = state.environmentPreview;
+  if (!element) return;
+  element.innerHTML = preview
+    ? `<section class="environment-preview"><div class="panel-head"><div class="panel-title">${icon(Shield)}<h3>环境配置差异</h3></div><span>备份：${escapeHtml(preview.backupName)}</span></div>
+       <div class="runtime-list">${preview.changes.map((change) => `<article class="runtime"><div><strong>${escapeHtml(change.name)}</strong><span>${escapeHtml(change.current || "未设置")} → ${escapeHtml(change.proposed || "不设置")}</span></div><small>${escapeHtml(change.impact)}</small></article>`).join("")}</div>
+       <div class="grid two"><div><h4>PATH 新增</h4>${preview.pathAdded.length ? `<ul>${preview.pathAdded.map((item) => `<li><code>${escapeHtml(item)}</code></li>`).join("")}</ul>` : `<div class="empty">没有新增条目</div>`}</div><div><h4>PATH 移除</h4>${preview.pathRemoved.length ? `<ul>${preview.pathRemoved.map((item) => `<li><code>${escapeHtml(item)}</code></li>`).join("")}</ul>` : `<div class="empty">不会移除外部路径</div>`}</div></div>
+       <ul>${preview.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>
+       <button id="apply-environment-preview" class="primary">二次确认并写入</button></section>`
+    : `<div class="empty">点击“预览配置”查看 DEVENV_HOME、JAVA_HOME 和 PATH 的实际差异</div>`;
+}
+
+function renderEnvironmentBackups() {
+  const element = document.querySelector<HTMLElement>("#env-backup-list");
+  if (!element) return;
+  element.innerHTML = state.environmentBackups.length
+    ? paginate("environment-backups", state.environmentBackups, (backup) => `<article class="runtime"><div><strong>${escapeHtml(backup.fileName)}</strong><span>${backup.pathEntries} 个 PATH 条目</span></div><small>DEVENV_HOME：${escapeHtml(backup.devenvHome || "未设置")} · JAVA_HOME：${escapeHtml(backup.javaHome || "未设置")}</small><div class="row-actions"><button data-restore-env-backup="${escapeHtml(backup.fileName)}">恢复此备份</button></div></article>`)
+    : `<div class="empty">还没有环境备份；首次应用配置时会自动创建</div>`;
+}
+
+function runtimeSwitchOptions(items: ManagedRuntime[], current?: string | null) {
+  return `<option value="">不切换${current ? `（当前 ${escapeHtml(current)}）` : ""}</option>${items.map((item) => `<option value="${escapeHtml(item.version)}">${escapeHtml(item.version)}</option>`).join("")}`;
+}
+
+function renderProjectConfigPreview() {
+  const element = document.querySelector<HTMLElement>("#project-config-preview");
+  const preview = state.projectConfigPreview;
+  const installed = state.config?.installed;
+  if (!element || !preview || !installed) return;
+  element.innerHTML = `
+    <div class="panel-head"><div class="panel-title">${icon(Hammer)}<h2>配置与环境切换预览</h2></div><span>${escapeHtml(preview.detectedTypes.join(" / ") || "未识别类型")}</span></div>
+    <div class="project-config-files">${preview.files.map((file, index) => `<article class="project-config-file"><label><input type="checkbox" data-project-file-enabled="${index}" ${file.enabled ? "checked" : ""} /><strong>${escapeHtml(file.relativePath)}</strong><span>${file.existed ? "将备份后更新" : "将新建"}</span></label><textarea data-project-file-content="${index}" spellcheck="false">${escapeHtml(file.content)}</textarea></article>`).join("")}</div>
+    <h3>可选运行时切换</h3>
+    <div class="runtime-switch-grid">
+      <label>JDK<select data-project-switch="jdk">${runtimeSwitchOptions(installed.jdks, installed.current.jdk)}</select></label>
+      <label>Python<select data-project-switch="python">${runtimeSwitchOptions(installed.pythons, installed.current.python)}</select></label>
+      <label>Node.js<select data-project-switch="node">${runtimeSwitchOptions(installed.nodes, installed.current.node)}</select></label>
+      <label>Maven<select data-project-switch="maven">${runtimeSwitchOptions(installed.mavens, installed.current.maven)}</select></label>
+      <label>Gradle<select data-project-switch="gradle">${runtimeSwitchOptions(installed.gradles, installed.current.gradle)}</select></label>
+      <label>Go<select data-project-switch="go">${runtimeSwitchOptions(installed.gos, installed.current.go)}</select></label>
+    </div>
+    <ul>${preview.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>
+    <button id="apply-project-config" class="primary">二次确认并应用</button>
+  `;
+}
+
+function renderCleanupPlan() {
+  const element = document.querySelector<HTMLElement>("#cleanup-plan-preview");
+  const execute = document.querySelector<HTMLButtonElement>("#execute-cleanup-plan");
+  if (!element || !execute) return;
+  const plan = state.cleanupPlan;
+  execute.disabled = !plan;
+  element.innerHTML = plan
+    ? `<div class="panel-head"><div class="panel-title">${icon(Shield)}<h2>清理计划预览</h2></div><span>${plan.selectedItems.length} 项 · ${formatBytes(plan.estimatedBytes)}</span></div>
+       <div class="runtime-list">${paginate("cleanup-plan", plan.selectedItems, (item) => `<article class="runtime"><div><strong>${escapeHtml(item.categoryId)}</strong><span>${formatBytes(item.size)} · ${riskText(item.risk)}风险</span></div><small>${escapeHtml(item.path)}</small><small>${item.reversible ? "移入回收站，可恢复" : "官方命令，缓存将重新生成"}</small></article>`)}</div>
+       ${plan.warnings.length ? `<ul>${plan.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}`
+    : `<div class="empty">选择项目后点击“预览清理计划”</div>`;
+}
+
+function renderCleanupResult() {
+  const targets = ["#cleanup-report", "#cleanup-plan-preview"];
+  const result = state.cleanupResult;
+  if (!result) return;
+  const html = `<div class="cleanup-result ${result.success ? "ok" : "warn"}">
+    <h2>${result.success ? "清理完成" : "清理部分完成"}</h2>
+    <div class="maintenance-metrics"><article class="maintenance-metric"><span>释放空间</span><strong>${formatBytes(result.cleanedBytes)}</strong></article><article class="maintenance-metric"><span>完成</span><strong>${result.cleanedItems}</strong></article><article class="maintenance-metric"><span>跳过</span><strong>${result.skippedItems}</strong></article><article class="maintenance-metric"><span>失败</span><strong>${result.failedItems}</strong></article></div>
+    ${result.failures.length ? `<ul>${result.failures.map((failure) => `<li><code>${escapeHtml(failure.path)}</code>：${escapeHtml(failure.reason)}</li>`).join("")}</ul>` : ""}
+    <div class="toolbar"><button data-cleanup-report-action="copy">复制 Markdown 报告</button><button data-cleanup-report-action="json">导出 JSON 报告</button></div>
+  </div>`;
+  targets.forEach((target) => {
+    const element = document.querySelector<HTMLElement>(target);
+    if (element) element.innerHTML = html;
+  });
+}
+
+function renderFolderUsage(target: string, report: FolderUsageReport | null, key: string) {
+  const element = document.querySelector<HTMLElement>(target);
+  if (!element || !report) return;
+  element.innerHTML = `<div class="project-summary"><strong>${escapeHtml(report.name)} · ${formatBytes(report.totalBytes)}</strong><span>${escapeHtml(report.path)}</span></div>
+    <div class="folder-usage-grid">${paginate(key, report.categories, (category) => `<article class="folder-usage-card"><div><strong>${escapeHtml(category.name)}</strong><span>${formatBytes(category.size)}</span></div><small>${escapeHtml(category.suggestion)}</small><div class="row-actions"><button data-action="open-analysis-path" data-path="${escapeHtml(category.path)}">打开目录</button><button data-action="copy-text" data-copy="${escapeHtml(category.path)}">复制路径</button></div></article>`)}</div>
+    <ul>${[...report.suggestions, ...report.warnings].map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function renderLargeFiles() {
+  const element = document.querySelector<HTMLElement>("#large-file-result");
+  if (!element) return;
+  element.innerHTML = state.largeFiles.length
+    ? paginate("large-files", state.largeFiles, (item) => `<article class="runtime"><div><strong>${escapeHtml(item.fileType)} · ${formatBytes(item.size)}</strong><span class="risk-chip risk-${escapeHtml(item.risk)}">${riskText(item.risk)}风险</span></div><small>${escapeHtml(item.path)}</small><small>${escapeHtml(item.suggestion)}</small><div class="row-actions"><button data-action="open-analysis-path" data-path="${escapeHtml(item.path)}">打开所在目录</button><button data-action="copy-text" data-copy="${escapeHtml(item.path)}">复制路径</button></div></article>`, 10)
+    : `<div class="empty">扫描范围内没有达到阈值的大文件</div>`;
+}
+
+function renderDuplicates() {
+  const element = document.querySelector<HTMLElement>("#duplicate-result");
+  if (!element) return;
+  element.innerHTML = state.duplicateGroups.length
+    ? `<div class="scan-summary"><strong>${state.duplicateGroups.length} 组</strong><span>预计可归档 ${formatBytes(state.duplicateGroups.reduce((sum, group) => sum + group.reclaimableEstimate, 0))}</span></div>${paginate("duplicate-groups", state.duplicateGroups, (group) => `<details class="maintenance-category"><summary><span><strong>${group.files.length} 个完全相同文件</strong><small>SHA256 ${escapeHtml(group.hash.slice(0, 16))}…</small></span><span><b>${formatBytes(group.size)}</b><i>可归档 ${formatBytes(group.reclaimableEstimate)}</i></span></summary><div class="runtime-list">${paginate(`duplicate-${group.hash}`, group.files, (file) => `<article class="runtime"><small>${escapeHtml(file.path)}</small><small>${escapeHtml(file.keepSuggestion)}</small><div class="row-actions"><button data-action="open-analysis-path" data-path="${escapeHtml(file.path)}">打开所在目录</button><button data-action="copy-text" data-copy="${escapeHtml(file.path)}">复制路径</button></div></article>`)}</div></details>`)} `
+    : `<div class="empty">没有发现达到阈值且 SHA256 完全相同的文件</div>`;
+}
+
+function renderAppUsageItem(item: AppUsageItem) {
+  return `<details class="maintenance-category"><summary><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.safeActions.join(" · "))}</small></span><span><b>${formatBytes(item.size)}</b><i class="risk-chip risk-medium">只读</i></span></summary><div class="folder-usage-grid">${item.categories.map((category) => `<article class="folder-usage-card"><div><strong>${escapeHtml(category.name)}</strong><span>${formatBytes(category.size)}</span></div><small>${escapeHtml(category.path)}</small><div class="row-actions"><button data-action="open-analysis-path" data-path="${escapeHtml(category.path)}">打开目录</button><button data-action="copy-text" data-copy="${escapeHtml(category.path)}">复制路径</button></div></article>`).join("")}</div><ul>${item.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul></details>`;
+}
+
+function renderAppUsage() {
+  const element = document.querySelector<HTMLElement>("#app-usage-result");
+  const report = state.appUsage;
+  if (!element || !report) return;
+  const applications = [
+    ...(report.wechat ? [report.wechat] : []),
+    ...(report.qq ? [report.qq] : []),
+    ...report.browsers,
+    ...report.netDisks,
+    ...report.videoEditors,
+    ...report.gamePlatforms,
+  ].sort((a, b) => b.size - a.size);
+  element.innerHTML = `<section><h3>常见应用、网盘与游戏库</h3>${applications.length ? paginate("app-usage", applications, renderAppUsageItem) : `<div class="empty">没有发现常见应用占用路径</div>`}</section>
+    <section><div class="panel-head"><h3>Windows 已安装软件</h3><button data-action="open-apps-features">打开系统卸载入口</button></div><div class="runtime-list">${paginate("installed-software", report.installedSoftware, (software) => `<article class="runtime"><div><strong>${escapeHtml(software.name)}</strong><span>${software.estimatedSize ? formatBytes(software.estimatedSize) : "未登记大小"}</span></div><small>${escapeHtml(software.publisher || "未知发布者")} · ${escapeHtml(software.installLocation || "未登记安装位置")}</small><small>${escapeHtml(software.suggestion)}</small><div class="row-actions">${software.installLocation ? `<button data-action="open-analysis-path" data-path="${escapeHtml(software.installLocation)}">打开位置</button>` : ""}${software.uninstallCommandExists ? `<button data-action="open-apps-features">系统卸载</button>` : ""}</div></article>`, 10)}</div></section>`;
 }
 
 async function inspectMaintenance() {
@@ -2541,9 +2885,11 @@ async function inspectMaintenance() {
 }
 
 async function scanMaintenance() {
-  showToast("正在执行只读扫描，不会删除任何文件");
+  showToast("正在执行安全扫描；此步骤不会删除任何文件");
   try {
     state.cleanupReport = await invoke<CleanupScanReport>("scan_cleanup_targets");
+    state.cleanupSelection.clear();
+    state.cleanupPlan = null;
     renderMaintenanceScan();
     showToast(`扫描完成：${state.cleanupReport.totalItems} 项，共 ${formatBytes(state.cleanupReport.totalBytes)}`);
   } catch (error) {
@@ -2804,9 +3150,25 @@ document.querySelector("#set-pip-index")?.addEventListener("click", () => {
   const value = document.querySelector<HTMLSelectElement>("#pip-index")?.value || "official";
   void runToolchainAction("pip_index", value);
 });
-document.querySelector("#configure-env")?.addEventListener("click", () => {
-  void runOperation(() => invoke<OperationResult>("configure_user_environment"), "正在配置用户环境变量");
+document.querySelector("#configure-env")?.addEventListener("click", async () => {
+  showToast("正在计算 DEVENV_HOME、JAVA_HOME 与 PATH 差异");
+  try {
+    state.environmentPreview = await invoke<EnvironmentConfigPreview>("preview_user_environment_configuration");
+    renderEnvironmentPreview();
+    showToast("环境配置预览已生成；确认差异后再写入");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
 });
+async function loadEnvironmentBackups() {
+  try {
+    state.environmentBackups = await invoke<EnvironmentBackupInfo[]>("list_environment_backups");
+    renderEnvironmentBackups();
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+}
+document.querySelector("#load-env-backups")?.addEventListener("click", () => void loadEnvironmentBackups());
 document.querySelector("#check-env-health")?.addEventListener("click", async () => {
   showToast("正在检查环境配置");
   try {
@@ -2818,9 +3180,11 @@ document.querySelector("#check-env-health")?.addEventListener("click", async () 
   }
 });
 document.querySelector("#cleanup-path")?.addEventListener("click", () => {
+  if (!window.confirm("将删除当前用户 PATH 中真实失效或重复的条目，并先创建环境备份；受管待安装路径会保留。确定继续吗？")) return;
   void runOperation(() => invoke<OperationResult>("cleanup_path_entries"), "正在清理真实失效和重复 PATH");
 });
 document.querySelector("#restore-env")?.addEventListener("click", () => {
+  if (!window.confirm("将恢复最近一次环境备份；已打开的终端和 IDE 不会自动刷新。确定继续吗？")) return;
   void runOperation(() => invoke<OperationResult>("restore_user_environment"), "正在恢复用户环境变量");
 });
 document.querySelector("#save-profile")?.addEventListener("click", () => {
@@ -2898,10 +3262,123 @@ document.querySelector("#load-cache")?.addEventListener("click", async () => {
   renderCache();
 });
 document.querySelector("#clear-cache")?.addEventListener("click", () => {
-  void runOperation(() => invoke<OperationResult>("clear_download_cache"), "正在清理下载缓存");
+  if (!window.confirm("下载缓存将逐项移入 Windows 回收站，不会删除受管运行时或配置。确定继续吗？")) return;
+  void runOperation(() => invoke<OperationResult>("clear_download_cache"), "正在将下载缓存移入回收站");
 });
 document.querySelector("#inspect-maintenance")?.addEventListener("click", () => void inspectMaintenance());
 document.querySelector("#scan-maintenance")?.addEventListener("click", () => void scanMaintenance());
+function selectCleanupMode(mode: "conservative" | "recommended" | "none") {
+  state.cleanupSelection.clear();
+  if (mode !== "none" && state.cleanupReport) {
+    state.cleanupReport.categories.forEach((category) => {
+      const selectedCategory = category.id === "devenv-manager" || (mode === "recommended" && category.id === "windows-temp");
+      if (selectedCategory) category.items.filter((item) => item.cleanable).forEach((item) => state.cleanupSelection.add(item.id));
+    });
+  }
+  state.cleanupPlan = null;
+  renderMaintenanceScan();
+  renderCleanupPlan();
+}
+document.querySelector("#select-conservative")?.addEventListener("click", () => selectCleanupMode("conservative"));
+document.querySelector("#select-recommended")?.addEventListener("click", () => selectCleanupMode("recommended"));
+document.querySelector("#clear-cleanup-selection")?.addEventListener("click", () => selectCleanupMode("none"));
+document.querySelector("#preview-cleanup-plan")?.addEventListener("click", async () => {
+  if (!state.cleanupReport || !state.cleanupSelection.size) return;
+  showToast("正在重新扫描并创建清理计划");
+  try {
+    state.cleanupPlan = await invoke<CleanupPlan>("create_cleanup_plan", { selectedItemIds: Array.from(state.cleanupSelection) });
+    renderCleanupPlan();
+    showToast(`计划已创建：${state.cleanupPlan.selectedItems.length} 项，预计 ${formatBytes(state.cleanupPlan.estimatedBytes)}`);
+  } catch (error) {
+    state.cleanupPlan = null;
+    renderCleanupPlan();
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+
+document.addEventListener("change", (event) => {
+  const checkbox = (event.target as HTMLElement).closest<HTMLInputElement>("input[data-cleanup-item]");
+  if (!checkbox) return;
+  const id = checkbox.dataset.cleanupItem || "";
+  if (checkbox.checked) state.cleanupSelection.add(id);
+  else state.cleanupSelection.delete(id);
+  state.cleanupPlan = null;
+  const preview = document.querySelector<HTMLButtonElement>("#preview-cleanup-plan");
+  const execute = document.querySelector<HTMLButtonElement>("#execute-cleanup-plan");
+  if (preview) preview.disabled = state.cleanupSelection.size === 0;
+  if (execute) execute.disabled = true;
+  renderCleanupPlan();
+});
+document.querySelector("#execute-cleanup-plan")?.addEventListener("click", async () => {
+  const plan = state.cleanupPlan;
+  if (!plan) return;
+  if (!window.confirm(`即将清理 ${plan.selectedItems.length} 项，预计释放 ${formatBytes(plan.estimatedBytes)}。后端会再次扫描并校验，普通文件移入回收站。确定继续吗？`)) return;
+  showToast("正在重新校验并执行清理计划");
+  try {
+    state.cleanupResult = await invoke<CleanupResult>("clean_selected_targets", { plan });
+    state.cleanupPlan = null;
+    state.cleanupSelection.clear();
+    renderCleanupResult();
+    showToast(`清理完成：释放 ${formatBytes(state.cleanupResult.cleanedBytes)}，失败 ${state.cleanupResult.failedItems} 项`, state.cleanupResult.failedItems > 0);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+document.querySelector("#inspect-desktop")?.addEventListener("click", async () => {
+  showToast("正在只读分析桌面文件类型与占用");
+  try {
+    state.desktopUsage = await invoke<FolderUsageReport>("inspect_desktop");
+    renderFolderUsage("#desktop-usage", state.desktopUsage, "desktop-usage");
+    showToast(`桌面分析完成：${formatBytes(state.desktopUsage.totalBytes)}`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+document.querySelector("#inspect-downloads")?.addEventListener("click", async () => {
+  showToast("正在只读分类下载目录");
+  try {
+    state.downloadsUsage = await invoke<FolderUsageReport>("inspect_downloads");
+    renderFolderUsage("#downloads-usage", state.downloadsUsage, "downloads-usage");
+    showToast(`下载目录分析完成：${formatBytes(state.downloadsUsage.totalBytes)}`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+document.querySelector("#scan-large-files")?.addEventListener("click", async () => {
+  const root = document.querySelector<HTMLInputElement>("#large-file-root")?.value.trim() || "";
+  const minSizeMb = Number(document.querySelector<HTMLInputElement>("#large-file-min")?.value || "100");
+  showToast("正在只读扫描大文件；不会读取文件内容");
+  try {
+    state.largeFiles = await invoke<LargeFileItem[]>("scan_large_files", { root, minSizeMb, limit: 100 });
+    renderLargeFiles();
+    showToast(`大文件扫描完成：${state.largeFiles.length} 项`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+document.querySelector("#scan-duplicates")?.addEventListener("click", async () => {
+  const root = document.querySelector<HTMLInputElement>("#duplicate-root")?.value.trim() || "";
+  const minSizeMb = Number(document.querySelector<HTMLInputElement>("#duplicate-min")?.value || "10");
+  if (!window.confirm(`将只在“${root || "用户目录"}”内对 ${minSizeMb} MB 以上、大小相同的候选文件计算 SHA256。不会上传或删除文件，确定继续吗？`)) return;
+  showToast("正在按大小分组并计算重复候选 SHA256");
+  try {
+    state.duplicateGroups = await invoke<DuplicateGroup[]>("scan_duplicate_large_files", { root, minSizeMb });
+    renderDuplicates();
+    showToast(`重复文件扫描完成：${state.duplicateGroups.length} 组`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+document.querySelector("#inspect-app-usage")?.addEventListener("click", async () => {
+  showToast("正在只读统计常见应用、游戏库与已安装软件");
+  try {
+    state.appUsage = await invoke<AppUsageReport>("inspect_app_usage");
+    renderAppUsage();
+    showToast("软件与常见应用分析完成");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
 document.querySelector("#check-updates")?.addEventListener("click", async () => {
   showToast("正在检查新版本");
   try {
@@ -2992,13 +3469,17 @@ document.querySelector("#check-project")?.addEventListener("click", async () => 
     showToast(error instanceof Error ? error.message : String(error), true);
   }
 });
-document.querySelector("#generate-vscode")?.addEventListener("click", () => {
+document.querySelector("#preview-project-config")?.addEventListener("click", async () => {
   const input = document.querySelector<HTMLInputElement>("#project-path");
   if (!input) return;
-  void runOperation(
-    () => invoke<OperationResult>("generate_vscode_config", { projectPath: input.value }),
-    "正在生成 VS Code 配置",
-  );
+  showToast("正在生成 VS Code / IDEA 配置预览");
+  try {
+    state.projectConfigPreview = await invoke<ProjectConfigPreview>("preview_project_configuration", { projectPath: input.value });
+    renderProjectConfigPreview();
+    showToast("配置预览已生成；确认内容后再应用");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
 });
 
 document.querySelector("#inspect-project-ports")?.addEventListener("click", () => void inspectProjectPorts());
@@ -3047,10 +3528,130 @@ document.querySelectorAll<HTMLButtonElement>(".sort-head").forEach((button) => {
 
 document.addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>(
-    "button[data-action], button[data-toolchain-action], button[data-python-tool]",
+    "button[data-action], button[data-toolchain-action], button[data-python-tool], button[data-page-key], button[data-dev-cache], button[data-chsrc-action], button[data-cleanup-report-action], button[data-restore-env-backup], #apply-project-config, #apply-environment-preview",
   );
   if (!button) return;
+  const pageKey = button.dataset.pageKey;
+  if (pageKey) {
+    paginationState.set(pageKey, Number(button.dataset.page || "1"));
+    if (pageKey === "ports") renderPorts();
+    else if (pageKey === "port-history") renderPortHistory();
+    else if (pageKey === "runtime-list" || pageKey.startsWith("managed-")) renderRuntimes();
+    else if (pageKey === "path-warnings") renderEnv();
+    else if (pageKey === "env-health") renderHealth();
+    else if (pageKey === "profiles") renderProfiles();
+    else if (pageKey === "agent-traces") renderAgentTraces();
+    else if (pageKey === "wsl-items") renderSystemPlatforms();
+    else if (pageKey === "local-services") renderLocalServices();
+    else if (pageKey === "download-cache") renderCache();
+    else if (pageKey === "project-ports") renderProjectPortConfigs();
+    else if (pageKey.startsWith("project-") && state.project) renderProjectAnalysis(state.project);
+    else if (pageKey === "environment-backups") renderEnvironmentBackups();
+    else if (pageKey === "desktop-usage") renderFolderUsage("#desktop-usage", state.desktopUsage, "desktop-usage");
+    else if (pageKey === "downloads-usage") renderFolderUsage("#downloads-usage", state.downloadsUsage, "downloads-usage");
+    else if (pageKey === "large-files") renderLargeFiles();
+    else if (pageKey === "duplicate-groups" || pageKey.startsWith("duplicate-")) renderDuplicates();
+    else if (pageKey === "app-usage" || pageKey === "installed-software") renderAppUsage();
+    else if (pageKey.startsWith("cleanup-")) {
+      renderMaintenanceScan();
+      renderCleanupPlan();
+    } else if (pageKey.startsWith("dotnet-") || pageKey === "rust-toolchains") renderPlatforms();
+    return;
+  }
+  const devCache = button.dataset.devCache;
+  if (devCache) {
+    if (!window.confirm(`将调用 ${button.title || button.textContent || devCache}。该命令会清除可重新生成的开发缓存，确定继续吗？`)) return;
+    void runOperation(() => invoke<OperationResult>("clean_dev_cache", { tool: devCache }), `正在使用 ${devCache} 官方命令清理缓存`).then(() => void scanMaintenance());
+    return;
+  }
+  const chsrcAction = button.dataset.chsrcAction;
+  if (chsrcAction) {
+    const target = document.querySelector<HTMLSelectElement>("#chsrc-target")?.value || "node";
+    const source = document.querySelector<HTMLInputElement>("#chsrc-source")?.value.trim() || null;
+    const changing = ["auto", "set", "reset"].includes(chsrcAction);
+    if (changing && !window.confirm(`将调用官方 chsrc 对 ${target} 执行 ${chsrcAction}，可能修改当前用户或工具配置。确定继续吗？`)) return;
+    void (async () => {
+      try {
+        const result = await invoke<OperationResult>("run_chsrc_action", { action: chsrcAction, target, source });
+        const output = document.querySelector<HTMLElement>("#chsrc-output");
+        if (output) output.textContent = result.message;
+        showToast("chsrc 操作完成");
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error), true);
+      }
+    })();
+    return;
+  }
+  if (button.dataset.cleanupReportAction === "copy") {
+    if (state.cleanupResult) void copyText(state.cleanupResult.reportMarkdown);
+    return;
+  }
+  if (button.dataset.cleanupReportAction === "json") {
+    void invoke<string>("export_cleanup_report", { format: "json" })
+      .then((path) => showToast(`JSON 报告已导出：${path}`))
+      .catch((error) => showToast(error instanceof Error ? error.message : String(error), true));
+    return;
+  }
+  if (button.id === "apply-project-config") {
+    const preview = state.projectConfigPreview;
+    if (!preview) return;
+    preview.files.forEach((file, index) => {
+      file.enabled = document.querySelector<HTMLInputElement>(`[data-project-file-enabled="${index}"]`)?.checked ?? false;
+      file.content = document.querySelector<HTMLTextAreaElement>(`[data-project-file-content="${index}"]`)?.value || "";
+    });
+    const switches: CurrentVersions = {};
+    document.querySelectorAll<HTMLSelectElement>("[data-project-switch]").forEach((select) => {
+      if (select.value) switches[select.dataset.projectSwitch as keyof CurrentVersions] = select.value;
+    });
+    const enabled = preview.files.filter((file) => file.enabled).length;
+    const switchCount = Object.keys(switches).length;
+    if (!window.confirm(`将写入 ${enabled} 个固定项目配置文件并切换 ${switchCount} 个运行时。已有文件和切换前环境都会备份，确定继续吗？`)) return;
+    void runOperation(
+      () => invoke<OperationResult>("apply_project_configuration", { request: { projectPath: preview.projectPath, files: preview.files, switches } }),
+      "正在备份并应用项目配置",
+    );
+    return;
+  }
+  if (button.id === "apply-environment-preview") {
+    const preview = state.environmentPreview;
+    if (!preview) return;
+    if (!window.confirm(`将按预览写入 ${preview.changes.length} 组当前用户环境配置，并先保存 ${preview.backupName}。确定继续吗？`)) return;
+    void runOperation(
+      () => invoke<OperationResult>("apply_user_environment_configuration", { previewId: preview.previewId }),
+      "正在备份、写入并回读验证用户环境变量",
+    ).then(async () => {
+      state.environmentPreview = null;
+      renderEnvironmentPreview();
+      await loadEnvironmentBackups();
+      await refreshAll(false);
+    });
+    return;
+  }
+  const restoreBackup = button.dataset.restoreEnvBackup;
+  if (restoreBackup) {
+    if (!window.confirm(`将恢复环境备份 ${restoreBackup}；恢复前会再保存当前状态。确定继续吗？`)) return;
+    void runOperation(
+      () => invoke<OperationResult>("restore_environment_backup", { fileName: restoreBackup }),
+      "正在恢复指定环境备份",
+    ).then(async () => {
+      await loadEnvironmentBackups();
+      await refreshAll(false);
+    });
+    return;
+  }
   const action = button.dataset.action;
+  if (action === "open-analysis-path") {
+    void invoke<OperationResult>("open_analysis_path", { path: button.dataset.path || "" })
+      .then((result) => showToast(result.message))
+      .catch((error) => showToast(error instanceof Error ? error.message : String(error), true));
+    return;
+  }
+  if (action === "open-apps-features") {
+    void invoke<OperationResult>("open_apps_features")
+      .then((result) => showToast(result.message))
+      .catch((error) => showToast(error instanceof Error ? error.message : String(error), true));
+    return;
+  }
   if (action === "doctor-fix") {
     const fix = button.dataset.fix || "";
     void runDoctorAction(fix).catch((error) => showToast(error instanceof Error ? error.message : String(error), true));

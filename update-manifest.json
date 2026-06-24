@@ -1,12 +1,14 @@
 {
-  "version": "1.1.0",
-  "date": "2026-06-23",
+  "version": "1.3.0",
+  "date": "2026-06-24",
   "notes": [
-    "命令面板新增开发工具白名单、危险命令拦截和管理员态保护",
-    "新增 JAVA_HOME、PATH、java、javac、Maven、Gradle 一致性检查与 Nacos 启动修复",
-    "新增实时生效版本、页面使用说明、AI Agent/CLI 痕迹只读分析和低打扰更新检查",
-    "C 盘急救默认排除个人目录，新增 WPS 明确缓存/日志只读扫描"
+    "C 盘急救 Phase 2 新增一次性清理计划、回收站清理、官方开发缓存命令与 Markdown/JSON 报告",
+    "修复 Go、Python/NuGet 和部分 JDK 下载重定向白名单与 Liberica 响应解析",
+    "新增 VS Code/IDEA 配置预览、可编辑确认、项目文件备份和切换前环境模板",
+    "整合官方 chsrc 固定参数入口、侧边栏分组、独立长列表统一分页和完整操作手册",
+    "新增桌面/下载分类、大文件、SHA256 重复文件和软件/应用/游戏占用只读分析",
+    "环境配置升级为差异预览、二次确认、历史备份、指定恢复和回读验证"
   ],
-  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.1.0/DevEnv.Manager_1.1.0_x64-setup.exe",
-  "sha256": "798bf54cb2545ab5e16d78a54591ce5ab56fee9659522c7c6ffdcf9f4efca414"
+  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.3.0/DevEnv.Manager_1.3.0_x64-setup.exe",
+  "sha256": "5e0512a16f77b340cd89c69619b28ef04f17d2a14ec8e0b1e968d482d8f86399"
 }

@@ -90,12 +90,12 @@ pub fn inspect_maintenance_overview(managed_root: &Path) -> Result<MaintenanceOv
         "critical" => "C 盘空间严重不足，建议尽快检查临时文件、开发缓存和可搬家目录。",
         "high" => "C 盘空间偏紧，建议优先查看安全清理估算与开发缓存。",
         "medium" => "C 盘空间需要关注，可以安排清理缓存或迁移大目录。",
-        "low" => "C 盘空间目前健康，仍可定期进行只读体检。",
+        "low" => "C 盘空间目前健康，仍可定期扫描并按计划执行保守清理。",
         _ => "暂未识别 C 盘容量，请确认磁盘卷可被 Windows 正常读取。",
     }
     .to_string();
     let mut suggestions = vec![
-        "先查看 C 盘专清和开发缓存分类；Phase 1 不会删除文件。".to_string(),
+        "先扫描并预览清理计划；Phase 2 只处理用户明确选择且再次校验通过的项目。".to_string(),
         "出于安全边界，默认扫描不会进入桌面、下载、文档或其他个人资料目录。".to_string(),
     ];
     if dev_cache_estimate > 1024 * 1024 * 1024 {

@@ -71,6 +71,8 @@ pub fn is_protected_path(path: &Path) -> bool {
         r"c:\program files (x86)",
         r"c:\programdata\microsoft",
         r"c:\$recycle.bin",
+        r"c:\windows.old",
+        r"c:\system volume information",
     ];
     if system_roots
         .iter()
@@ -79,12 +81,22 @@ pub fn is_protected_path(path: &Path) -> bool {
         return true;
     }
     if let Some(home) = user_home() {
-        if ["Documents", "Desktop", "Pictures", "Videos", "Music"]
-            .iter()
-            .any(|name| is_same_or_inside(path, &home.join(name)))
+        if [
+            "Documents",
+            "Downloads",
+            "Desktop",
+            "Pictures",
+            "Videos",
+            "Music",
+        ]
+        .iter()
+        .any(|name| is_same_or_inside(path, &home.join(name)))
         {
             return true;
         }
+    }
+    if [r"c:\hiberfil.sys", r"c:\pagefile.sys", r"c:\swapfile.sys"].contains(&value.as_str()) {
+        return true;
     }
     if let Ok(project) = env::current_dir() {
         if is_same_or_inside(path, &project) {
@@ -122,6 +134,9 @@ pub(crate) fn is_sensitive_account_data(path: &Path) -> bool {
         || value.contains("\\tencent files\\")
         || value.contains("\\wechat\\")
         || value.contains("\\qq\\")
+        || value.contains("\\google\\chrome\\")
+        || value.contains("\\microsoft\\edge\\")
+        || value.contains("\\mozilla\\firefox\\")
 }
 
 pub fn should_skip_path(path: &Path) -> Option<String> {
@@ -135,6 +150,12 @@ pub fn should_skip_path(path: &Path) -> Option<String> {
         || value.contains("\\qq\\")
     {
         return Some("微信/QQ 用户数据库受保护".to_string());
+    }
+    if value.contains("\\google\\chrome\\")
+        || value.contains("\\microsoft\\edge\\")
+        || value.contains("\\mozilla\\firefox\\")
+    {
+        return Some("浏览器用户目录受保护".to_string());
     }
     if is_inside_managed_runtime(path) {
         return Some("DevEnv Manager 受管运行时受保护".to_string());
@@ -172,5 +193,25 @@ mod tests {
         assert!(!is_inside_managed_runtime(Path::new(
             r"D:\DevEnvManager\downloads\jdk.zip"
         )));
+    }
+
+    #[test]
+    fn user_sensitive_directories_and_credentials_are_protected() {
+        if let Some(home) = dirs::home_dir() {
+            assert!(is_protected_path(&home.join("Downloads")));
+            assert!(is_protected_path(&home.join("Desktop")));
+        }
+        assert!(should_skip_path(Path::new(
+            r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Cookies"
+        ))
+        .is_some());
+        assert!(should_skip_path(Path::new(
+            r"C:\Users\test\Documents\WeChat Files\wxid\Msg\MicroMsg.db"
+        ))
+        .is_some());
+        assert!(should_skip_path(Path::new(
+            r"C:\Users\test\AppData\Local\Microsoft\Edge\User Data\Default\Login Data"
+        ))
+        .is_some());
     }
 }

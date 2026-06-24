@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -75,4 +75,134 @@ pub struct CleanupItem {
     pub cleanable: bool,
     pub selected_by_default: bool,
     pub skipped_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupPlan {
+    pub plan_id: String,
+    pub created_at: String,
+    pub selected_items: Vec<CleanupPlanItem>,
+    pub estimated_bytes: u64,
+    pub risk_summary: Vec<String>,
+    pub requires_admin: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupPlanItem {
+    pub item_id: String,
+    pub path: String,
+    pub size: u64,
+    pub category_id: String,
+    pub risk: String,
+    pub action: String,
+    pub reversible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupResult {
+    pub plan_id: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub success: bool,
+    pub cleaned_bytes: u64,
+    pub cleaned_items: usize,
+    pub skipped_items: usize,
+    pub failed_items: usize,
+    pub failures: Vec<CleanupFailure>,
+    pub report_markdown: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupFailure {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LargeFileItem {
+    pub path: String,
+    pub size: u64,
+    pub modified_at: Option<String>,
+    pub file_type: String,
+    pub suggestion: String,
+    pub risk: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroup {
+    pub size: u64,
+    pub hash: String,
+    pub files: Vec<DuplicateFileItem>,
+    pub reclaimable_estimate: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateFileItem {
+    pub path: String,
+    pub modified_at: Option<String>,
+    pub keep_suggestion: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderUsageItem {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub category: String,
+    pub suggestion: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderUsageReport {
+    pub name: String,
+    pub path: String,
+    pub total_bytes: u64,
+    pub categories: Vec<FolderUsageItem>,
+    pub suggestions: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUsageReport {
+    pub wechat: Option<AppUsageItem>,
+    pub qq: Option<AppUsageItem>,
+    pub browsers: Vec<AppUsageItem>,
+    pub net_disks: Vec<AppUsageItem>,
+    pub video_editors: Vec<AppUsageItem>,
+    pub game_platforms: Vec<AppUsageItem>,
+    pub installed_software: Vec<InstalledSoftwareUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUsageItem {
+    pub name: String,
+    pub detected: bool,
+    pub path: String,
+    pub size: u64,
+    pub categories: Vec<FolderUsageItem>,
+    pub safe_actions: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledSoftwareUsage {
+    pub name: String,
+    pub publisher: String,
+    pub install_location: String,
+    pub estimated_size: u64,
+    pub uninstall_command_exists: bool,
+    pub suggestion: String,
 }

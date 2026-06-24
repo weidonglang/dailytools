@@ -4,7 +4,7 @@ mod diagnostics;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -12,6 +12,7 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tauri::Emitter;
 use tempfile::Builder as TempBuilder;
@@ -46,7 +47,7 @@ const BLOCKED_NAMES: [&str; 9] = [
     "lsass.exe",
 ];
 const CAUTION_NAMES: [&str; 1] = ["svchost.exe"];
-const ALLOWED_DOWNLOAD_HOSTS: [&str; 22] = [
+const ALLOWED_DOWNLOAD_HOSTS: [&str; 24] = [
     "api.adoptium.net",
     "github.com",
     "objects.githubusercontent.com",
@@ -59,11 +60,13 @@ const ALLOWED_DOWNLOAD_HOSTS: [&str; 22] = [
     "services.gradle.org",
     "downloads.gradle.org",
     "go.dev",
+    "dl.google.com",
     "raw.githubusercontent.com",
     "api.github.com",
     "api.azul.com",
     "cdn.azul.com",
     "api.bell-sw.com",
+    "download.bell-sw.com",
     "aka.ms",
     "download.visualstudio.microsoft.com",
     "bootstrap.pypa.io",
@@ -215,6 +218,48 @@ struct EnvSnapshot {
     devenv_home: Option<String>,
     path_warnings: Vec<String>,
 }
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentValueChange {
+    name: String,
+    current: String,
+    proposed: String,
+    impact: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentConfigPreview {
+    preview_id: String,
+    created_at: String,
+    changes: Vec<EnvironmentValueChange>,
+    path_added: Vec<String>,
+    path_removed: Vec<String>,
+    warnings: Vec<String>,
+    backup_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentBackupInfo {
+    file_name: String,
+    created_at: String,
+    devenv_home: String,
+    java_home: String,
+    path_entries: usize,
+}
+
+#[derive(Clone)]
+struct PendingEnvironmentConfig {
+    preview: EnvironmentConfigPreview,
+    java_home: Option<String>,
+    path: String,
+    baseline_fingerprint: String,
+}
+
+static ENVIRONMENT_PREVIEWS: OnceLock<Mutex<HashMap<String, PendingEnvironmentConfig>>> =
+    OnceLock::new();
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -458,6 +503,33 @@ struct ProjectAnalysis {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProjectConfigFileDraft {
+    relative_path: String,
+    content: String,
+    existed: bool,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectConfigPreview {
+    project_path: String,
+    detected_types: Vec<String>,
+    files: Vec<ProjectConfigFileDraft>,
+    current: CurrentVersions,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectConfigApplyRequest {
+    project_path: String,
+    files: Vec<ProjectConfigFileDraft>,
+    switches: CurrentVersions,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ToolState {
@@ -560,6 +632,7 @@ struct PlatformReport {
     rust: RustEnvironment,
     dotnet: DotnetEnvironment,
     mirrors: MirrorCenter,
+    chsrc: ToolState,
     generated_at: String,
 }
 
@@ -809,6 +882,143 @@ async fn inspect_disk_overview() -> Result<Vec<cleanup::DiskVolumeInfo>, String>
 }
 
 #[tauri::command]
+async fn create_cleanup_plan(
+    selected_item_ids: Vec<String>,
+) -> Result<cleanup::CleanupPlan, String> {
+    run_blocking(move || {
+        let paths = load_paths()?;
+        cleanup::create_cleanup_plan(&paths.root, selected_item_ids)
+    })
+    .await?
+}
+
+#[tauri::command]
+async fn clean_selected_targets(
+    plan: cleanup::CleanupPlan,
+) -> Result<cleanup::CleanupResult, String> {
+    run_blocking(move || {
+        let paths = load_paths()?;
+        cleanup::clean_selected_targets(&paths.root, plan)
+    })
+    .await?
+}
+
+#[tauri::command]
+async fn clean_managed_download_cache() -> Result<cleanup::CleanupResult, String> {
+    run_blocking(move || {
+        let paths = load_paths()?;
+        Ok(cleanup::clean_managed_download_cache(&paths.root))
+    })
+    .await?
+}
+
+#[tauri::command]
+async fn clean_dev_cache(tool: String) -> Result<OperationResult, String> {
+    run_blocking(move || {
+        let paths = load_paths()?;
+        let message = cleanup::clean_dev_cache(&tool, &paths.root)?;
+        Ok(OperationResult {
+            success: true,
+            message,
+        })
+    })
+    .await?
+}
+
+#[tauri::command]
+fn export_cleanup_report(format: String) -> Result<String, String> {
+    let content = cleanup::export_cleanup_report(&format)?;
+    let paths = load_paths()?;
+    let reports = paths.root.join("reports");
+    fs::create_dir_all(&reports).map_err(|error| format!("创建报告目录失败：{error}"))?;
+    let extension = match format.trim().to_ascii_lowercase().as_str() {
+        "markdown" | "md" => "md",
+        "json" => "json",
+        _ => return Err("仅支持导出 Markdown 或 JSON".to_string()),
+    };
+    let target = reports.join(format!(
+        "cleanup-report-{}.{}",
+        filename_timestamp(),
+        extension
+    ));
+    fs::write(&target, content).map_err(|error| format!("写入清理报告失败：{error}"))?;
+    Ok(display_path(target))
+}
+
+#[tauri::command]
+async fn scan_large_files(
+    root: String,
+    min_size_mb: u64,
+    limit: usize,
+) -> Result<Vec<cleanup::LargeFileItem>, String> {
+    run_blocking(move || cleanup::scan_large_files(root, min_size_mb, limit)).await?
+}
+
+#[tauri::command]
+async fn scan_duplicate_large_files(
+    root: String,
+    min_size_mb: u64,
+) -> Result<Vec<cleanup::DuplicateGroup>, String> {
+    run_blocking(move || cleanup::scan_duplicate_large_files(root, min_size_mb)).await?
+}
+
+#[tauri::command]
+async fn inspect_downloads() -> Result<cleanup::FolderUsageReport, String> {
+    run_blocking(|| Ok(cleanup::inspect_downloads())).await?
+}
+
+#[tauri::command]
+async fn inspect_desktop() -> Result<cleanup::FolderUsageReport, String> {
+    run_blocking(|| Ok(cleanup::inspect_desktop())).await?
+}
+
+#[tauri::command]
+async fn inspect_app_usage() -> Result<cleanup::AppUsageReport, String> {
+    run_blocking(|| Ok(cleanup::inspect_app_usage())).await?
+}
+
+#[tauri::command]
+async fn inspect_installed_software_usage() -> Result<Vec<cleanup::InstalledSoftwareUsage>, String>
+{
+    run_blocking(|| Ok(cleanup::inspect_installed_software_usage())).await?
+}
+
+#[tauri::command]
+fn open_analysis_path(path: String) -> Result<OperationResult, String> {
+    let path = PathBuf::from(path.trim());
+    let target = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "无法识别所在目录".to_string())?
+    };
+    if !target.is_dir() {
+        return Err("目录不存在".to_string());
+    }
+    hidden_command("explorer.exe")
+        .arg(&target)
+        .spawn()
+        .map_err(|error| format!("打开目录失败：{error}"))?;
+    Ok(OperationResult {
+        success: true,
+        message: format!("已打开：{}", display_path(target)),
+    })
+}
+
+#[tauri::command]
+fn open_apps_features() -> Result<OperationResult, String> {
+    hidden_command("explorer.exe")
+        .arg("ms-settings:appsfeatures")
+        .spawn()
+        .map_err(|error| format!("打开 Windows 已安装的应用失败：{error}"))?;
+    Ok(OperationResult {
+        success: true,
+        message: "已打开 Windows 已安装的应用；请通过系统卸载入口操作".to_string(),
+    })
+}
+
+#[tauri::command]
 fn jdk_distributions() -> Vec<JdkDistribution> {
     vec![
         JdkDistribution {
@@ -974,10 +1184,49 @@ struct ToolDefinition {
     supports_mirror: bool,
 }
 
-fn configure_user_environment_blocking() -> Result<OperationResult, String> {
-    let paths = load_paths()?;
-    paths.ensure().map_err(|err| err.to_string())?;
-    let environment = user_environment()?;
+fn environment_preview_store() -> &'static Mutex<HashMap<String, PendingEnvironmentConfig>> {
+    ENVIRONMENT_PREVIEWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn split_path_entries(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn environment_fingerprint(environment: &HashMap<String, String>) -> String {
+    let mut hasher = Sha256::new();
+    for name in ["DEVENV_HOME", "JAVA_HOME"] {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(
+            environment
+                .get(name)
+                .map(String::as_str)
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        hasher.update([0]);
+    }
+    hasher.update(b"Path\0");
+    hasher.update(
+        environment
+            .get("Path")
+            .or_else(|| environment.get("PATH"))
+            .map(String::as_str)
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    format!("{:x}", hasher.finalize())
+}
+
+fn create_environment_backup(
+    paths: &AppPaths,
+    environment: &HashMap<String, String>,
+) -> Result<String, String> {
     let old_path = environment
         .get("Path")
         .or_else(|| environment.get("PATH"))
@@ -990,6 +1239,202 @@ fn configure_user_environment_blocking() -> Result<OperationResult, String> {
         "Path": old_path,
     });
     save_json(&paths.env_backup_file(), &backup)?;
+    let directory = paths.config().join("env_backups");
+    fs::create_dir_all(&directory).map_err(|error| format!("创建环境备份目录失败：{error}"))?;
+    let file_name = format!("env-backup-{}.json", filename_timestamp());
+    save_json(&directory.join(&file_name), &backup)?;
+    if let Ok(entries) = fs::read_dir(&directory) {
+        let mut files = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        files.sort();
+        let remove_count = files.len().saturating_sub(20);
+        for old in files.into_iter().take(remove_count) {
+            let _ = fs::remove_file(old);
+        }
+    }
+    Ok(file_name)
+}
+
+#[tauri::command]
+fn preview_user_environment_configuration() -> Result<EnvironmentConfigPreview, String> {
+    let paths = load_paths()?;
+    paths.ensure().map_err(|error| error.to_string())?;
+    let environment = user_environment()?;
+    let old_path = environment
+        .get("Path")
+        .or_else(|| environment.get("PATH"))
+        .cloned()
+        .unwrap_or_default();
+    let proposed_path = merge_path(&old_path);
+    let java_home = select_java_home(&paths, &environment);
+    let current_devenv = environment.get("DEVENV_HOME").cloned().unwrap_or_default();
+    let proposed_devenv = display_path(&paths.root);
+    let current_java = environment.get("JAVA_HOME").cloned().unwrap_or_default();
+    let old_entries = split_path_entries(&old_path);
+    let new_entries = split_path_entries(&proposed_path);
+    let normalized_old = old_entries
+        .iter()
+        .map(|entry| entry.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let normalized_new = new_entries
+        .iter()
+        .map(|entry| entry.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let path_added = new_entries
+        .iter()
+        .filter(|entry| !normalized_old.contains(&entry.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let path_removed = old_entries
+        .iter()
+        .filter(|entry| !normalized_new.contains(&entry.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let created_at = unix_timestamp().to_string();
+    let mut hasher = Sha256::new();
+    hasher.update(created_at.as_bytes());
+    hasher.update(proposed_devenv.as_bytes());
+    hasher.update(proposed_path.as_bytes());
+    let preview_id = format!("env-{:x}", hasher.finalize());
+    let backup_name = "env-backup-<应用时间>.json".to_string();
+    let mut warnings = inspect_path_entries(&new_entries, &paths);
+    warnings.push("只修改当前用户环境变量；已打开的终端和 IDE 不会自动刷新".to_string());
+    let preview = EnvironmentConfigPreview {
+        preview_id: preview_id.clone(),
+        created_at,
+        changes: vec![
+            EnvironmentValueChange {
+                name: "DEVENV_HOME".to_string(),
+                current: current_devenv,
+                proposed: proposed_devenv,
+                impact: "DevEnv Manager 受管目录根路径".to_string(),
+            },
+            EnvironmentValueChange {
+                name: "JAVA_HOME".to_string(),
+                current: current_java,
+                proposed: java_home.clone().unwrap_or_default(),
+                impact: "仅在已验证 JDK 可用时设置".to_string(),
+            },
+            EnvironmentValueChange {
+                name: "Path".to_string(),
+                current: format!("{} 个条目", old_entries.len()),
+                proposed: format!("{} 个条目", new_entries.len()),
+                impact: "受管路径置前并去重；不删除外部工具路径".to_string(),
+            },
+        ],
+        path_added,
+        path_removed,
+        warnings,
+        backup_name,
+    };
+    let now = unix_timestamp();
+    let mut previews = environment_preview_store()
+        .lock()
+        .map_err(|_| "环境配置预览暂时不可用".to_string())?;
+    previews.retain(|_, pending| {
+        pending
+            .preview
+            .created_at
+            .parse::<u64>()
+            .unwrap_or(0)
+            .saturating_add(10 * 60)
+            >= now
+    });
+    previews.insert(
+        preview_id,
+        PendingEnvironmentConfig {
+            preview: preview.clone(),
+            java_home,
+            path: proposed_path,
+            baseline_fingerprint: environment_fingerprint(&environment),
+        },
+    );
+    Ok(preview)
+}
+
+#[tauri::command]
+fn apply_user_environment_configuration(preview_id: String) -> Result<OperationResult, String> {
+    let pending = environment_preview_store()
+        .lock()
+        .map_err(|_| "环境配置预览暂时不可用".to_string())?
+        .remove(&preview_id)
+        .ok_or_else(|| "环境配置预览不存在、已应用或已过期，请重新预览".to_string())?;
+    let created = pending.preview.created_at.parse::<u64>().unwrap_or(0);
+    if created.saturating_add(10 * 60) < unix_timestamp() {
+        return Err("环境配置预览已超过 10 分钟，请重新预览".to_string());
+    }
+    let paths = load_paths()?;
+    let environment = user_environment()?;
+    if environment_fingerprint(&environment) != pending.baseline_fingerprint {
+        return Err("用户环境变量在预览后发生变化，已拒绝写入；请重新预览".to_string());
+    }
+    let backup = create_environment_backup(&paths, &environment)?;
+    set_user_environment_values(&paths, pending.java_home.as_deref(), &pending.path)?;
+    broadcast_environment_change();
+    Ok(OperationResult {
+        success: true,
+        message: format!("用户环境变量已写入并回读验证；备份：{backup}"),
+    })
+}
+
+#[tauri::command]
+fn list_environment_backups() -> Result<Vec<EnvironmentBackupInfo>, String> {
+    let paths = load_paths()?;
+    let directory = paths.config().join("env_backups");
+    let mut result = Vec::new();
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Ok(result);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.starts_with("env-backup-") || !file_name.ends_with(".json") {
+            continue;
+        }
+        let Ok(value) = read_json::<Value>(&path) else {
+            continue;
+        };
+        result.push(EnvironmentBackupInfo {
+            file_name,
+            created_at: value
+                .get("created_at")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            devenv_home: value
+                .get("DEVENV_HOME")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            java_home: value
+                .get("JAVA_HOME")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            path_entries: value
+                .get("Path")
+                .and_then(Value::as_str)
+                .map(|path| split_path_entries(path).len())
+                .unwrap_or(0),
+        });
+    }
+    result.sort_by(|a, b| b.file_name.cmp(&a.file_name));
+    Ok(result)
+}
+
+fn configure_user_environment_blocking() -> Result<OperationResult, String> {
+    let paths = load_paths()?;
+    paths.ensure().map_err(|err| err.to_string())?;
+    let environment = user_environment()?;
+    let old_path = environment
+        .get("Path")
+        .or_else(|| environment.get("PATH"))
+        .cloned()
+        .unwrap_or_default();
+    let backup_name = create_environment_backup(&paths, &environment)?;
     let selected_java_home = select_java_home(&paths, &environment);
     set_user_environment_values(
         &paths,
@@ -1000,8 +1445,10 @@ fn configure_user_environment_blocking() -> Result<OperationResult, String> {
     Ok(OperationResult {
         success: true,
         message: selected_java_home
-            .map(|value| format!("已配置用户环境变量，JAVA_HOME = {value}"))
-            .unwrap_or_else(|| "已配置用户环境变量，未发现可用 JAVA_HOME".to_string()),
+            .map(|value| format!("已配置用户环境变量，JAVA_HOME = {value}；备份：{backup_name}"))
+            .unwrap_or_else(|| {
+                format!("已配置用户环境变量，未发现可用 JAVA_HOME；备份：{backup_name}")
+            }),
     })
 }
 
@@ -1041,6 +1488,11 @@ fn cleanup_path_entries_blocking() -> Result<OperationResult, String> {
     }
 
     let new_path = retained.join(";");
+    let backup_name = if removed > 0 {
+        Some(create_environment_backup(&paths, &environment)?)
+    } else {
+        None
+    };
     let java_home = environment.get("JAVA_HOME").map(String::as_str);
     set_user_environment_values(&paths, java_home, &new_path)?;
     broadcast_environment_change();
@@ -1049,7 +1501,10 @@ fn cleanup_path_entries_blocking() -> Result<OperationResult, String> {
         message: if removed == 0 {
             "PATH 没有需要清理的真实失效或重复项".to_string()
         } else {
-            format!("已清理 {removed} 个真实失效或重复 PATH，托管待安装路径已保留")
+            format!(
+                "已清理 {removed} 个真实失效或重复 PATH，托管待安装路径已保留；备份：{}",
+                backup_name.unwrap_or_default()
+            )
         },
     })
 }
@@ -1070,6 +1525,32 @@ fn restore_user_environment_blocking() -> Result<OperationResult, String> {
     Ok(OperationResult {
         success: true,
         message: "已恢复上一次备份的用户环境变量".to_string(),
+    })
+}
+
+#[tauri::command]
+fn restore_environment_backup(file_name: String) -> Result<OperationResult, String> {
+    if !file_name.starts_with("env-backup-")
+        || !file_name.ends_with(".json")
+        || file_name
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+    {
+        return Err("环境备份文件名无效".to_string());
+    }
+    let paths = load_paths()?;
+    let source = paths.config().join("env_backups").join(&file_name);
+    let backup: Value = read_json(&source)?;
+    let current = user_environment()?;
+    let safety_backup = create_environment_backup(&paths, &current)?;
+    let path = backup.get("Path").and_then(Value::as_str).unwrap_or("");
+    let devenv_home = backup.get("DEVENV_HOME").and_then(Value::as_str);
+    let java_home = backup.get("JAVA_HOME").and_then(Value::as_str);
+    restore_environment_values(devenv_home, java_home, path)?;
+    broadcast_environment_change();
+    Ok(OperationResult {
+        success: true,
+        message: format!("已恢复环境备份 {file_name}；恢复前状态另存为 {safety_backup}"),
     })
 }
 
@@ -1588,16 +2069,7 @@ fn switch_runtime_blocking(
         .transpose()?
         .unwrap_or_default();
     if meta.kind == "jdk" {
-        save_json(
-            &paths.env_backup_file(),
-            &json!({
-                "created_at": current_timestamp(),
-                "reason": format!("切换 JDK 到 {selected_version} 前的快照"),
-                "DEVENV_HOME": previous_environment.get("DEVENV_HOME"),
-                "JAVA_HOME": previous_environment.get("JAVA_HOME"),
-                "Path": previous_environment.get("Path").or_else(|| previous_environment.get("PATH")),
-            }),
-        )?;
+        create_environment_backup(&paths, &previous_environment)?;
     }
     switch_junction(&paths.current().join(meta.link_name), &target, &paths.root)?;
     set_current(&mut installed, meta.kind, Some(selected_version.clone()));
@@ -2331,27 +2803,16 @@ fn cache_entries(calculate_hash: bool) -> Result<Vec<CacheEntry>, String> {
 #[tauri::command]
 fn clear_download_cache() -> Result<OperationResult, String> {
     let paths = load_paths()?;
-    let downloads = paths.downloads();
-    fs::create_dir_all(&downloads).map_err(|err| format!("创建缓存目录失败：{err}"))?;
-    let mut count = 0_u64;
-    let mut size = 0_u64;
-    for item in fs::read_dir(&downloads).map_err(|err| format!("读取缓存目录失败：{err}"))?
-    {
-        let path = item.map_err(|err| err.to_string())?.path();
-        if !path.is_file() {
-            continue;
-        }
-        paths.assert_inside_root(&path)?;
-        if path.parent() != Some(downloads.as_path()) {
-            continue;
-        }
-        size += path.metadata().map(|meta| meta.len()).unwrap_or(0);
-        fs::remove_file(path).map_err(|err| format!("删除缓存失败：{err}"))?;
-        count += 1;
-    }
+    let result = cleanup::clean_managed_download_cache(&paths.root);
     Ok(OperationResult {
-        success: true,
-        message: format!("已清理 {count} 个缓存文件，释放 {}", format_size(size)),
+        success: result.success,
+        message: format!(
+            "下载缓存已移入回收站：{} 项，释放 {}，跳过 {}，失败 {}",
+            result.cleaned_items,
+            format_size(result.cleaned_bytes),
+            result.skipped_items,
+            result.failed_items
+        ),
     })
 }
 
@@ -3576,6 +4037,7 @@ fn inspect_platform_toolchains_blocking() -> Result<PlatformReport, String> {
     let home = dirs::home_dir().unwrap_or_default();
     let maven_settings_path = home.join(".m2/settings.xml");
     let gradle_init_path = home.join(".gradle/init.gradle");
+    let chsrc = probe_tool("chsrc", resolve_tool(&paths, "chsrc"), &["--version"]);
 
     Ok(PlatformReport {
         go: GoEnvironment {
@@ -3616,7 +4078,63 @@ fn inspect_platform_toolchains_blocking() -> Result<PlatformReport, String> {
             cargo_config_path: display_path(&cargo_config_path),
             cargo_config_exists: cargo_config_path.is_file(),
         },
+        chsrc,
         generated_at: current_timestamp(),
+    })
+}
+
+#[tauri::command]
+async fn run_chsrc_action(
+    action: String,
+    target: String,
+    source: Option<String>,
+) -> Result<OperationResult, String> {
+    run_blocking(move || run_chsrc_action_blocking(&action, &target, source.as_deref())).await?
+}
+
+fn run_chsrc_action_blocking(
+    action: &str,
+    target: &str,
+    source: Option<&str>,
+) -> Result<OperationResult, String> {
+    const TARGETS: [&str; 9] = [
+        "node", "python", "go", "rust", "cargo", "maven", "gradle", "nuget", "dotnet",
+    ];
+    let target = target.trim().to_ascii_lowercase();
+    if !TARGETS.contains(&target.as_str()) {
+        return Err("该换源目标未进入 DevEnv Manager 安全白名单".to_string());
+    }
+    let paths = load_paths()?;
+    let executable = resolve_tool(&paths, "chsrc").ok_or_else(|| {
+        "未找到 chsrc。请先通过 Scoop 或 WinGet 安装官方 RubyMetric/chsrc".to_string()
+    })?;
+    let output = match action {
+        "get" => run_action_command(&paths, executable, &["get", &target])?,
+        "list" => run_action_command(&paths, executable, &["list", &target])?,
+        "measure" => run_action_command(&paths, executable, &["measure", &target])?,
+        "auto" => run_action_command(&paths, executable, &["set", &target])?,
+        "reset" => run_action_command(&paths, executable, &["reset", &target])?,
+        "set" => {
+            let source = source.unwrap_or_default().trim().to_ascii_lowercase();
+            if source.is_empty()
+                || source.len() > 40
+                || !source
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            {
+                return Err("镜像源只能填写 chsrc 列出的源 ID；不接受自定义 URL".to_string());
+            }
+            run_action_command(&paths, executable, &["set", &target, &source])?
+        }
+        _ => return Err("不支持的 chsrc 操作".to_string()),
+    };
+    Ok(OperationResult {
+        success: true,
+        message: if output.trim().is_empty() {
+            format!("chsrc {action} {target} 执行完成")
+        } else {
+            output
+        },
     })
 }
 
@@ -5230,43 +5748,225 @@ fn self_uninstall_blocking() -> Result<OperationResult, String> {
 }
 
 #[tauri::command]
-fn generate_vscode_config(project_path: String) -> Result<OperationResult, String> {
+fn preview_project_configuration(project_path: String) -> Result<ProjectConfigPreview, String> {
     let root = PathBuf::from(project_path.trim());
-    if !root.is_dir() {
-        return Err("项目目录不存在".to_string());
-    }
-    let vscode = root.join(".vscode");
-    fs::create_dir_all(&vscode).map_err(|err| format!("创建 .vscode 失败：{err}"))?;
+    let analysis = analyze_project_blocking(&root)?;
+    let installed = load_installed(&load_paths()?)?;
+    let package_manager = analysis.package_manager.as_deref().unwrap_or("npm");
     let settings = json!({
         "terminal.integrated.defaultProfile.windows": "PowerShell",
         "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
         "java.configuration.updateBuildConfiguration": "interactive",
-        "npm.packageManager": "npm"
+        "npm.packageManager": package_manager
     });
     let tasks = json!({
         "version": "2.0.0",
-        "tasks": [
-            {
-                "label": "Python: pytest",
+        "tasks": analysis.actions.iter()
+            .filter(|action| action.safe_to_run && !matches!(action.id.as_str(), "vscode" | "copy_commands" | "nacos_start"))
+            .map(|action| json!({
+                "label": action.title,
                 "type": "shell",
-                "command": "python -m pytest -q",
-                "group": "test",
+                "command": action.command,
                 "problemMatcher": []
-            },
-            {
-                "label": "Node: test",
-                "type": "shell",
-                "command": "npm test",
-                "group": "test",
-                "problemMatcher": []
-            }
-        ]
+            }))
+            .collect::<Vec<_>>()
     });
-    save_json(&vscode.join("settings.json"), &settings)?;
-    save_json(&vscode.join("tasks.json"), &tasks)?;
+    let jdk = installed.current.jdk.as_deref().unwrap_or("17");
+    let safe_jdk = jdk
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+        .collect::<String>();
+    let proposals = [
+        (
+            ".vscode/settings.json",
+            serde_json::to_string_pretty(&settings)
+                .map_err(|error| format!("生成 VS Code 设置失败：{error}"))?,
+        ),
+        (
+            ".vscode/tasks.json",
+            serde_json::to_string_pretty(&tasks)
+                .map_err(|error| format!("生成 VS Code 任务失败：{error}"))?,
+        ),
+        (
+            ".idea/misc.xml",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project version=\"4\">\n  <component name=\"ProjectRootManager\" version=\"2\" languageLevel=\"JDK_{safe_jdk}\" project-jdk-name=\"{safe_jdk}\" project-jdk-type=\"JavaSDK\" />\n</project>\n"
+            ),
+        ),
+        (
+            ".idea/compiler.xml",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project version=\"4\">\n  <component name=\"CompilerConfiguration\">\n    <bytecodeTargetLevel target=\"{safe_jdk}\" />\n  </component>\n</project>\n"
+            ),
+        ),
+    ];
+    let files = proposals
+        .into_iter()
+        .map(|(relative_path, content)| ProjectConfigFileDraft {
+            existed: root.join(relative_path).exists(),
+            relative_path: relative_path.to_string(),
+            content,
+            enabled: true,
+        })
+        .collect();
+    Ok(ProjectConfigPreview {
+        project_path: display_path(&root),
+        detected_types: analysis.project_types,
+        files,
+        current: installed.current,
+        warnings: vec![
+            "应用前可逐项编辑；仅允许写入固定的 .vscode/.idea 配置文件".to_string(),
+            "已有文件会备份到项目内 .devenv-manager/backups/时间戳 目录".to_string(),
+            "切换运行时前会自动保存一份时间命名的环境变量模板".to_string(),
+        ],
+    })
+}
+
+fn allowed_project_config(relative: &str) -> bool {
+    matches!(
+        relative.replace('\\', "/").as_str(),
+        ".vscode/settings.json" | ".vscode/tasks.json" | ".idea/misc.xml" | ".idea/compiler.xml"
+    )
+}
+
+fn restore_project_files(changes: &[(PathBuf, Option<PathBuf>)]) {
+    for (target, backup) in changes.iter().rev() {
+        if let Some(backup) = backup {
+            let _ = fs::copy(backup, target);
+        } else {
+            let _ = fs::remove_file(target);
+        }
+    }
+}
+
+#[tauri::command]
+fn apply_project_configuration(
+    request: ProjectConfigApplyRequest,
+) -> Result<OperationResult, String> {
+    let root = PathBuf::from(request.project_path.trim());
+    analyze_project_blocking(&root)?;
+    if request.files.len() > 4 {
+        return Err("项目配置文件数量超出安全限制".to_string());
+    }
+    let backup_stamp = filename_timestamp();
+    let backup_root = root
+        .join(".devenv-manager")
+        .join("backups")
+        .join(&backup_stamp);
+    let enabled = request
+        .files
+        .iter()
+        .filter(|file| file.enabled)
+        .collect::<Vec<_>>();
+    for file in &enabled {
+        if !allowed_project_config(&file.relative_path) {
+            return Err(format!("不允许写入该项目配置：{}", file.relative_path));
+        }
+        if file.content.len() > 64 * 1024 || file.content.chars().any(|ch| ch == '\0') {
+            return Err(format!("项目配置内容无效或过大：{}", file.relative_path));
+        }
+        let target = root.join(file.relative_path.replace('/', "\\"));
+        if fs::symlink_metadata(&target)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(format!("拒绝写入符号链接：{}", file.relative_path));
+        }
+        if target
+            .parent()
+            .and_then(|parent| fs::symlink_metadata(parent).ok())
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(format!("拒绝写入符号链接目录：{}", file.relative_path));
+        }
+    }
+    let has_switches = [
+        &request.switches.jdk,
+        &request.switches.python,
+        &request.switches.node,
+        &request.switches.maven,
+        &request.switches.gradle,
+        &request.switches.go,
+    ]
+    .iter()
+    .any(|value| value.is_some());
+    let env_backup = if has_switches {
+        let name = format!("自动备份 项目切换 {backup_stamp}");
+        save_config_profile_blocking(name.clone())?;
+        load_profiles(&load_paths()?)?
+            .into_iter()
+            .find(|profile| profile.name == name)
+    } else {
+        None
+    };
+    let mut changes = Vec::new();
+    for file in enabled {
+        let relative = file.relative_path.replace('\\', "/");
+        let target = root.join(&relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建项目配置目录失败：{error}"))?;
+        }
+        let backup = if target.exists() {
+            let backup = backup_root.join(&relative);
+            if let Some(parent) = backup.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("创建项目配置备份目录失败：{error}"))?;
+            }
+            fs::copy(&target, &backup)
+                .map_err(|error| format!("备份 {} 失败：{error}", file.relative_path))?;
+            Some(backup)
+        } else {
+            None
+        };
+        if let Err(error) = fs::write(&target, &file.content) {
+            changes.push((target, backup));
+            restore_project_files(&changes);
+            return Err(format!("写入 {} 失败：{error}", file.relative_path));
+        }
+        changes.push((target, backup));
+    }
+    let switches = [
+        ("jdk", request.switches.jdk),
+        ("python", request.switches.python),
+        ("node", request.switches.node),
+        ("maven", request.switches.maven),
+        ("gradle", request.switches.gradle),
+        ("go", request.switches.go),
+    ];
+    for (kind, version) in switches {
+        if let Some(version) = version {
+            if let Err(error) = switch_runtime_blocking(kind.to_string(), version, None) {
+                restore_project_files(&changes);
+                if let Some(profile) = &env_backup {
+                    let _ = apply_config_profile_blocking(profile.id.clone());
+                }
+                return Err(format!("项目运行时切换失败，已尝试恢复：{error}"));
+            }
+        }
+    }
     Ok(OperationResult {
         success: true,
-        message: format!("已生成 VS Code 配置：{}", display_path(vscode)),
+        message: format!(
+            "项目配置已应用；文件备份：{}{}",
+            display_path(backup_root),
+            env_backup
+                .map(|profile| format!("；环境模板：{}", profile.name))
+                .unwrap_or_default()
+        ),
+    })
+}
+
+#[tauri::command]
+fn generate_vscode_config(project_path: String) -> Result<OperationResult, String> {
+    let preview = preview_project_configuration(project_path.clone())?;
+    apply_project_configuration(ProjectConfigApplyRequest {
+        project_path,
+        files: preview
+            .files
+            .into_iter()
+            .filter(|file| file.relative_path.starts_with(".vscode/"))
+            .collect(),
+        switches: CurrentVersions::default(),
     })
 }
 
@@ -5279,6 +5979,19 @@ pub fn run() {
             scan_cleanup_targets,
             inspect_maintenance_overview,
             inspect_disk_overview,
+            create_cleanup_plan,
+            clean_selected_targets,
+            clean_managed_download_cache,
+            clean_dev_cache,
+            export_cleanup_report,
+            scan_large_files,
+            scan_duplicate_large_files,
+            inspect_downloads,
+            inspect_desktop,
+            inspect_app_usage,
+            inspect_installed_software_usage,
+            open_analysis_path,
+            open_apps_features,
             jdk_distributions,
             check_for_updates,
             download_update,
@@ -5290,6 +6003,10 @@ pub fn run() {
             inspect_java_environment,
             inspect_agent_traces,
             configure_user_environment,
+            preview_user_environment_configuration,
+            apply_user_environment_configuration,
+            list_environment_backups,
+            restore_environment_backup,
             cleanup_path_entries,
             restore_user_environment,
             discover_runtimes,
@@ -5314,6 +6031,7 @@ pub fn run() {
             inspect_toolchains,
             run_toolchain_action,
             inspect_platform_toolchains,
+            run_chsrc_action,
             run_platform_action,
             inspect_system_platforms,
             manage_system_platform,
@@ -5343,6 +6061,8 @@ pub fn run() {
             export_config_profiles,
             preview_config_profiles,
             import_config_profiles,
+            preview_project_configuration,
+            apply_project_configuration,
             uninstall_external_runtime,
             self_uninstall,
             generate_vscode_config
@@ -5437,7 +6157,7 @@ fn run_cli(args: Vec<String>) -> Result<String, String> {
                     .map_err(|err| format!("生成 JSON 失败：{err}"))
             } else {
                 Ok(format!(
-                    "扫描到 {} 个统计项，共 {}。\nPhase 1 仅扫描，不会删除、移动或修改文件。",
+                    "扫描到 {} 个统计项，共 {}。\nCLI cleanup scan 始终只读；清理计划必须在 GUI 中预览并确认。",
                     report.total_items,
                     format_byte_size(report.total_bytes)
                 ))
@@ -6247,12 +6967,22 @@ fn resolve_liberica_release(version: &str) -> Result<ReleaseInfo, String> {
     let url = format!(
         "https://api.bell-sw.com/v1/liberica/releases?version-feature={version}&version-modifier=latest&os=windows&arch=x86&bitness=64&package-type=zip&bundle-type=jdk"
     );
-    let package: Value = reqwest::blocking::get(&url)
+    let response: Value = reqwest::blocking::get(&url)
         .map_err(|err| format!("查询 BellSoft Liberica 失败：{err}"))?
         .error_for_status()
         .map_err(|err| format!("查询 BellSoft Liberica 失败：{err}"))?
         .json()
         .map_err(|err| format!("解析 BellSoft Liberica 响应失败：{err}"))?;
+    let package = response
+        .as_array()
+        .and_then(|items| items.first())
+        .or_else(|| {
+            response
+                .get("releases")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+        })
+        .unwrap_or(&response);
     let name = package
         .get("filename")
         .and_then(Value::as_str)
@@ -6277,7 +7007,7 @@ fn resolve_microsoft_jdk_release(version: &str) -> Result<ReleaseInfo, String> {
     let url = format!("https://aka.ms/download-jdk/microsoft-jdk-{version}-windows-x64.zip");
     let checksum_url = format!("{url}.sha256sum.txt");
     let client = reqwest::blocking::Client::builder()
-        .user_agent("DevEnvManager/1.1")
+        .user_agent("DevEnvManager/1.3")
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|err| format!("创建 Microsoft JDK 客户端失败：{err}"))?;
@@ -6552,9 +7282,13 @@ fn version_key(tag: &str) -> (u64, u64, u64) {
 
 fn validate_download_url(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|err| format!("下载地址无效：{err}"))?;
+    validate_download_url_value(&parsed)
+}
+
+fn validate_download_url_value(parsed: &reqwest::Url) -> Result<(), String> {
     let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
     if parsed.scheme() != "https" || !ALLOWED_DOWNLOAD_HOSTS.contains(&host.as_str()) {
-        return Err(format!("下载地址不在安全白名单中：{url}"));
+        return Err(format!("下载地址不在安全白名单中：{parsed}"));
     }
     Ok(())
 }
@@ -6593,6 +7327,16 @@ fn download_file_with_progress(
     ));
     let client = reqwest::blocking::Client::builder()
         .user_agent("DevEnvManager/2.0")
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("下载重定向次数过多");
+            }
+            if validate_download_url_value(attempt.url()).is_ok() {
+                attempt.follow()
+            } else {
+                attempt.error("下载重定向地址不在安全白名单中")
+            }
+        }))
         .build()
         .map_err(|err| format!("创建下载客户端失败：{err}"))?;
     let mut response = client
@@ -8804,6 +9548,22 @@ mod tests {
     }
 
     #[test]
+    fn environment_backup_keeps_latest_and_history() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(root.path().join("DevEnvManager"));
+        paths.ensure().unwrap();
+        let environment = HashMap::from([
+            ("DEVENV_HOME".to_string(), r"D:\OldDevEnv".to_string()),
+            ("JAVA_HOME".to_string(), r"D:\Java\jdk-21".to_string()),
+            ("Path".to_string(), r"C:\Windows;D:\Tools".to_string()),
+        ]);
+        let file_name = create_environment_backup(&paths, &environment).unwrap();
+        assert!(paths.env_backup_file().is_file());
+        assert!(paths.config().join("env_backups").join(file_name).is_file());
+        assert_eq!(split_path_entries(&environment["Path"]).len(), 2);
+    }
+
+    #[test]
     fn parse_socket_handles_ipv4_and_ipv6() {
         assert_eq!(
             parse_socket("127.0.0.1:8080"),
@@ -8866,6 +9626,20 @@ mod tests {
     }
 
     #[test]
+    fn project_config_paths_are_strictly_limited() {
+        assert!(allowed_project_config(".vscode/settings.json"));
+        assert!(allowed_project_config(r".idea\misc.xml"));
+        assert!(!allowed_project_config("pom.xml"));
+        assert!(!allowed_project_config("../outside.json"));
+    }
+
+    #[test]
+    fn chsrc_rejects_unknown_target_before_execution() {
+        let error = run_chsrc_action_blocking("get", "unknown-target", None).unwrap_err();
+        assert!(error.contains("白名单"));
+    }
+
+    #[test]
     fn project_signals_detect_mixed_tauri_project() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("package.json"), "{}").unwrap();
@@ -8905,7 +9679,33 @@ mod tests {
     #[test]
     fn download_url_allowlist_rejects_unknown_hosts() {
         assert!(validate_download_url("https://nodejs.org/dist/index.json").is_ok());
+        assert!(validate_download_url("https://dl.google.com/go/go1.25.windows-amd64.zip").is_ok());
+        assert!(validate_download_url("https://download.bell-sw.com/java/21/file.zip").is_ok());
         assert!(validate_download_url("https://example.com/file.zip").is_err());
+        assert!(validate_download_url("http://go.dev/dl/file.zip").is_err());
+    }
+
+    #[test]
+    fn liberica_parser_accepts_array_response() {
+        let response = json!([{
+            "filename": "bellsoft-jdk21.zip",
+            "downloadUrl": "https://download.bell-sw.com/java/21/bellsoft-jdk21.zip",
+            "version": "21.0.8"
+        }]);
+        let package = response
+            .as_array()
+            .and_then(|items| items.first())
+            .or_else(|| {
+                response
+                    .get("releases")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+            })
+            .unwrap_or(&response);
+        assert_eq!(
+            package.get("filename").and_then(Value::as_str),
+            Some("bellsoft-jdk21.zip")
+        );
     }
 
     #[test]
@@ -9029,13 +9829,17 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_architecture_is_scan_only() {
+    fn cleanup_architecture_enables_only_phase2_safe_categories() {
         let architecture = cleanup::architecture();
-        assert_eq!(architecture.status, "scan-only-phase-1");
-        assert!(!architecture
+        assert_eq!(architecture.status, "safe-clean-and-analysis-phase-3");
+        assert!(architecture
             .categories
             .iter()
-            .any(|category| category.cleanup_enabled));
+            .any(|category| { category.id == "windows-temp" && category.cleanup_enabled }));
+        assert!(architecture
+            .categories
+            .iter()
+            .any(|category| { category.id == "devenv-manager" && category.cleanup_enabled }));
         assert!(!architecture
             .categories
             .iter()
