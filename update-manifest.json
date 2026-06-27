@@ -1,13 +1,9 @@
 {
-  "version": "1.5.1",
+  "version": "1.5.2",
   "date": "2026-06-27",
   "notes": [
-    "1.5.1 Final Stable：软著前稳定版收口，停止扩展新系统管家方向，集中强化开发环境诊断和安全说明",
-    "新增 Python 受管安装完整性检查：pip、venv、ssl、sqlite3、ctypes 为核心检查，tkinter 为可选提示",
-    "新增受管 Python pip 修复计划防误修边界，非受管 Python 只提示不自动修复",
-    "新增项目文件夹选择、IDEA/IntelliJ 配置只读分析、Nacos/Nexus/Maven/Gradle Java 消费者验证",
-    "新增 JDK/Python/Node/Maven/Gradle/Go 强验证报告，安装后登记前强化 java/javac/jar 等组件检查"
+    "1.5.2 Patch：修复用户反馈与软件工程审查问题，强化安全边界、端口管理、MySQL 修复、Python/chsrc 可恢复性和质量门禁"
   ],
-  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.5.1/DevEnv.Manager_1.5.1_x64-setup.exe",
-  "sha256": "645efdb09c2266b9eafe99e380eab43e0bf41a5f36bf8a017cac9806b3687609"
+  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.5.2/DevEnv.Manager_1.5.2_x64-setup.exe",
+  "sha256": "1244d8888bf1e197fa59131381c4e52a897e94ceec518d743e4fdd9a20224a90"
 }

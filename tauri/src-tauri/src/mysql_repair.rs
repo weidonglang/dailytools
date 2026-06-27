@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -40,6 +40,10 @@ pub struct MySqlCandidate {
     pub port: u16,
     pub port_occupied: bool,
     pub data_health: String,
+    pub confidence: String,
+    pub conclusion_level: String,
+    pub evidence: Vec<String>,
+    pub next_steps: Vec<String>,
     pub system_schema_missing: bool,
     pub business_databases: Vec<String>,
     pub last_error: String,
@@ -61,6 +65,8 @@ pub struct MySqlRepairPlan {
     pub warnings: Vec<String>,
     pub requires_admin: bool,
     pub requires_backup: bool,
+    pub risk_level: String,
+    pub plan_fingerprint: String,
 }
 
 #[derive(Clone)]
@@ -70,11 +76,46 @@ struct PendingPlan {
     created_at: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct BackupReceipt {
     datadir: String,
     destination: String,
     created_at: u64,
+    expires_at: u64,
+    files: usize,
+    bytes: u64,
+    ibdata: bool,
+    frm: bool,
+    business_schema: bool,
+    manifest_path: String,
+    manifest_hash: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BackupManifest {
+    schema_version: u32,
+    datadir: String,
+    destination: String,
+    created_at: u64,
+    expires_at: u64,
+    files: usize,
+    bytes: u64,
+    ibdata: bool,
+    frm: bool,
+    business_schema: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MySqlPendingExecutionGuard {
+    pub action_id: String,
+    pub plan_id: String,
+    pub risk_level: String,
+    pub plan_fingerprint: String,
+    pub backup_required: bool,
+    pub backup_receipt: Option<String>,
 }
 
 static PLANS: OnceLock<Mutex<HashMap<String, PendingPlan>>> = OnceLock::new();
@@ -86,6 +127,103 @@ fn plans() -> &'static Mutex<HashMap<String, PendingPlan>> {
 
 fn backups() -> &'static Mutex<Vec<BackupReceipt>> {
     BACKUPS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn app_config_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("DevEnvManager")
+}
+
+fn backup_registry_file() -> PathBuf {
+    app_config_dir().join("mysql-backups.json")
+}
+
+fn load_persisted_backups() -> Vec<BackupReceipt> {
+    let path = backup_registry_file();
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<BackupReceipt>>(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|receipt| verify_backup_receipt(receipt).is_ok())
+        .collect()
+}
+
+fn save_persisted_backups(receipts: &[BackupReceipt]) -> Result<(), String> {
+    let path = backup_registry_file();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("创建 MySQL 备份登记目录失败：{err}"))?;
+    }
+    let text = serde_json::to_string_pretty(receipts)
+        .map_err(|err| format!("生成 MySQL 备份登记失败：{err}"))?;
+    fs::write(path, text).map_err(|err| format!("写入 MySQL 备份登记失败：{err}"))
+}
+
+fn backup_manifest_hash(manifest: &BackupManifest) -> Result<String, String> {
+    let text = serde_json::to_string(manifest)
+        .map_err(|err| format!("生成备份 manifest 校验失败：{err}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn write_backup_manifest(manifest: &BackupManifest) -> Result<(String, String), String> {
+    let destination = Path::new(&manifest.destination);
+    fs::create_dir_all(destination).map_err(|err| format!("创建备份目录失败：{err}"))?;
+    let target = destination.join("devenv-mysql-backup-manifest.json");
+    let text = serde_json::to_string_pretty(manifest)
+        .map_err(|err| format!("生成备份 manifest 失败：{err}"))?;
+    fs::write(&target, text).map_err(|err| format!("写入备份 manifest 失败：{err}"))?;
+    Ok((display(&target), backup_manifest_hash(manifest)?))
+}
+
+fn verify_backup_receipt(receipt: &BackupReceipt) -> Result<(), String> {
+    if receipt.expires_at < now() {
+        return Err("备份回执已超过有效期".to_string());
+    }
+    if !Path::new(&receipt.destination).is_dir() {
+        return Err("备份目录不存在".to_string());
+    }
+    let manifest_path = Path::new(&receipt.manifest_path);
+    let text = fs::read_to_string(manifest_path)
+        .map_err(|_| "备份 manifest 不存在或不可读".to_string())?;
+    let manifest: BackupManifest =
+        serde_json::from_str(&text).map_err(|_| "备份 manifest 已损坏".to_string())?;
+    if manifest.datadir != receipt.datadir
+        || manifest.destination != receipt.destination
+        || manifest.files != receipt.files
+        || manifest.bytes != receipt.bytes
+        || manifest.expires_at != receipt.expires_at
+        || backup_manifest_hash(&manifest)? != receipt.manifest_hash
+    {
+        return Err("备份 manifest 与登记回执不一致".to_string());
+    }
+    Ok(())
+}
+
+fn remember_backup(receipt: BackupReceipt) -> Result<(), String> {
+    let mut registry = load_persisted_backups();
+    registry.retain(|item| item.datadir != receipt.datadir || item.expires_at >= now());
+    registry.push(receipt.clone());
+    save_persisted_backups(&registry)?;
+    backups()
+        .lock()
+        .map_err(|_| "备份记录暂时不可用".to_string())?
+        .push(receipt);
+    Ok(())
+}
+
+fn recent_valid_backup(datadir: &str) -> Option<BackupReceipt> {
+    let mut all = load_persisted_backups();
+    if let Ok(memory) = backups().lock() {
+        all.extend(memory.iter().cloned());
+    }
+    all.into_iter().find(|item| {
+        item.datadir.eq_ignore_ascii_case(datadir) && verify_backup_receipt(item).is_ok()
+    })
 }
 
 fn now() -> u64 {
@@ -385,8 +523,26 @@ fn candidate_from(
         .unwrap_or_default();
     let last_error = redact_error_log(&raw_error);
     let port_occupied = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_err();
-    let status = if system_schema_missing && !business_databases.is_empty() {
-        "DataBroken"
+    let unsupported_layout = display(&mysqld).to_ascii_lowercase().contains("xampp")
+        || display(&mysqld).to_ascii_lowercase().contains("phpstudy")
+        || display(&mysqld).to_ascii_lowercase().contains("laragon")
+        || version == "MariaDB";
+    let conclusion_level = if unsupported_layout {
+        "UnsupportedLayout"
+    } else if service_state.eq_ignore_ascii_case("Running") && port_occupied {
+        "Healthy"
+    } else if system_schema_missing && !business_databases.is_empty() && !port_occupied {
+        "LikelyBroken"
+    } else if system_schema_missing && business_databases.is_empty() {
+        "PotentialRisk"
+    } else if service.is_none() || port_occupied {
+        "UsableWithWarnings"
+    } else {
+        "PermissionUnknown"
+    }
+    .to_string();
+    let status = if conclusion_level == "UnsupportedLayout" {
+        "UnsupportedLayout"
     } else if service_state.eq_ignore_ascii_case("Running") {
         if raw_error.contains("1045") {
             "AuthFailed"
@@ -415,6 +571,59 @@ fn candidate_from(
             business_databases.join("、")
         ));
     }
+    let evidence = vec![
+        format!("服务名：{service_name}"),
+        format!("服务状态：{service_state}"),
+        format!("mysqld：{}", display(&mysqld)),
+        format!("my.ini：{}", display(&ini)),
+        format!("basedir：{}", display(&basedir)),
+        format!("datadir：{}", display(&datadir)),
+        format!(
+            "端口 {port} 监听：{}",
+            if port_occupied { "是" } else { "否" }
+        ),
+        format!(
+            "静态文件：mysql 系统库{}，业务库候选 {} 个",
+            if system_schema_missing {
+                "缺失或不完整"
+            } else {
+                "可读"
+            },
+            business_databases.len()
+        ),
+        "连接验证：未保存密码，默认不自动连接数据库".to_string(),
+        format!(
+            "结论可信度：{}",
+            if unsupported_layout {
+                "低"
+            } else if service.is_some() {
+                "中高"
+            } else {
+                "中"
+            }
+        ),
+        format!(
+            "判断原因：{}",
+            if system_schema_missing {
+                "静态系统库检查异常，需结合服务状态/端口/连接验证确认"
+            } else {
+                "服务、配置和 Data 静态检查未发现系统库缺失"
+            }
+        ),
+    ];
+    let confidence = if unsupported_layout {
+        "低：非标准发行版/布局，仅提示，不自动修复"
+    } else if service.is_some() && datadir.is_dir() {
+        "中高：服务登记与配置/Data 路径均可验证"
+    } else {
+        "中：缺少服务登记或权限证据"
+    }
+    .to_string();
+    let mut next_steps = suggestions.clone();
+    if next_steps.is_empty() {
+        next_steps
+            .push("如仍无法启动，请先导出错误日志并使用只读向导排查账号或端口问题".to_string());
+    }
     let quoted_mysqld = format!("\"{}\"", display(&mysqld));
     let quoted_ini = format!("\"{}\"", display(&ini));
     MySqlCandidate {
@@ -430,6 +639,10 @@ fn candidate_from(
         port,
         port_occupied,
         data_health: if system_schema_missing { "MySQL 系统库缺失或不完整" } else if datadir.is_dir() { "Data 目录可读" } else { "Data 目录不存在" }.to_string(),
+        confidence,
+        conclusion_level,
+        evidence,
+        next_steps,
         system_schema_missing,
         business_databases,
         last_error,
@@ -564,6 +777,8 @@ pub fn create_plan(candidate_id: String, action: String) -> Result<MySqlRepairPl
     hasher.update(action.as_bytes());
     hasher.update(created.to_le_bytes());
     let plan_id = format!("mysql-{:x}", hasher.finalize());
+    let risk_level = mysql_action_risk(&action).to_string();
+    let plan_fingerprint = plan_fingerprint(&candidate, &action);
     let public = MySqlRepairPlan {
         plan_id: plan_id.clone(),
         created_at: created.to_string(),
@@ -575,6 +790,8 @@ pub fn create_plan(candidate_id: String, action: String) -> Result<MySqlRepairPl
         warnings: vec!["计划 30 分钟过期且只能执行一次；执行前会重新诊断路径与状态".to_string()],
         requires_admin,
         requires_backup,
+        risk_level,
+        plan_fingerprint,
     };
     let pending = PendingPlan {
         public: public.clone(),
@@ -587,6 +804,50 @@ pub fn create_plan(candidate_id: String, action: String) -> Result<MySqlRepairPl
     store.retain(|_, value| value.created_at.saturating_add(30 * 60) >= created);
     store.insert(plan_id, pending);
     Ok(public)
+}
+
+fn mysql_action_risk(action: &str) -> &'static str {
+    match action {
+        "repair_system_schema" => "critical",
+        "register_service" | "start_service" | "backup" => "high",
+        _ => "low",
+    }
+}
+
+fn plan_fingerprint(candidate: &MySqlCandidate, action: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(candidate.id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(action.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(candidate.mysqld_path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(candidate.my_ini_path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(candidate.datadir.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn pending_execution_guard(plan_id: &str) -> Result<MySqlPendingExecutionGuard, String> {
+    let pending = plans()
+        .lock()
+        .map_err(|_| "MySQL 计划存储暂时不可用".to_string())?
+        .get(plan_id)
+        .cloned()
+        .ok_or_else(|| "计划不存在、已执行或已过期".to_string())?;
+    let backup = if pending.public.requires_backup {
+        recent_valid_backup(&pending.candidate.datadir).map(|item| item.manifest_hash)
+    } else {
+        None
+    };
+    Ok(MySqlPendingExecutionGuard {
+        action_id: format!("mysql_{}", pending.public.action),
+        plan_id: pending.public.plan_id,
+        risk_level: pending.public.risk_level,
+        plan_fingerprint: pending.public.plan_fingerprint,
+        backup_required: pending.public.requires_backup,
+        backup_receipt: backup,
+    })
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(u64, usize, bool, bool, bool), String> {
@@ -707,8 +968,35 @@ pub fn execute(plan_id: String, backup_destination: Option<String>) -> Result<St
         "backup" => {
             let destination = backup_destination.filter(|v| !v.trim().is_empty()).ok_or_else(|| "请选择备份目标目录".to_string())?;
             let (bytes, files, ibdata, frm, business) = copy_tree(Path::new(&current.datadir), Path::new(&destination))?;
-            backups().lock().map_err(|_| "备份记录暂时不可用".to_string())?.push(BackupReceipt { datadir: current.datadir, destination: destination.clone(), created_at: now() });
-            Ok(format!("Data 备份完成：{files} 个文件，{bytes} 字节；ibdata1={}，业务库目录={}，.frm={}；目标：{destination}", ibdata, business, frm))
+            let created_at = now();
+            let expires_at = created_at + 24 * 60 * 60;
+            let manifest = BackupManifest {
+                schema_version: 1,
+                datadir: current.datadir.clone(),
+                destination: destination.clone(),
+                created_at,
+                expires_at,
+                files,
+                bytes,
+                ibdata,
+                frm,
+                business_schema: business,
+            };
+            let (manifest_path, manifest_hash) = write_backup_manifest(&manifest)?;
+            remember_backup(BackupReceipt {
+                datadir: current.datadir,
+                destination: destination.clone(),
+                created_at,
+                expires_at,
+                files,
+                bytes,
+                ibdata,
+                frm,
+                business_schema: business,
+                manifest_path: manifest_path.clone(),
+                manifest_hash: manifest_hash.clone(),
+            })?;
+            Ok(format!("Data 备份完成：{files} 个文件，{bytes} 字节；ibdata1={}，业务库目录={}，.frm={}；目标：{destination}；manifest：{manifest_path}；回执：{manifest_hash}", ibdata, business, frm))
         }
         "register_service" => {
             if !Path::new(&current.mysqld_path).is_file() || !Path::new(&current.my_ini_path).is_file() { return Err("mysqld.exe 或 my.ini 已不存在".to_string()); }
@@ -724,8 +1012,7 @@ pub fn execute(plan_id: String, backup_destination: Option<String>) -> Result<St
             Ok(format!("已请求启动服务 {}；请重新诊断确认状态和端口", current.service_name))
         }
         "repair_system_schema" => {
-            let recent = backups().lock().map_err(|_| "备份记录暂时不可用".to_string())?.iter().find(|item| item.datadir.eq_ignore_ascii_case(&current.datadir) && item.created_at.saturating_add(24 * 60 * 60) >= now()).cloned();
-            let receipt = recent.ok_or_else(|| "没有找到近 24 小时内由本程序完成的 Data 备份，禁止修复系统库".to_string())?;
+            let receipt = recent_valid_backup(&current.datadir).ok_or_else(|| "没有找到近 24 小时内由本程序完成且 manifest 校验通过的 Data 备份，禁止修复系统库".to_string())?;
             let source = Path::new(&current.basedir).join("data").join("mysql");
             let target = Path::new(&current.datadir).join("mysql");
             copy_missing_system_schema(&source, &target)?;

@@ -205,6 +205,31 @@ struct KillResult {
     blocked: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ConfirmationToken {
+    token: String,
+    action_id: String,
+    plan_id: String,
+    risk_level: String,
+    plan_fingerprint: String,
+    backup_receipt: Option<String>,
+    triple_confirmed: bool,
+    created_at: u64,
+    expires_at: u64,
+    used: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfirmationTokenView {
+    token: String,
+    action_id: String,
+    plan_id: String,
+    risk_level: String,
+    expires_at: u64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot {
@@ -310,6 +335,14 @@ struct PortRecord {
     common_usage: String,
     explanation: String,
     risk: String,
+    identity: String,
+    confidence: u8,
+    evidence_count: usize,
+    conflict_count: usize,
+    risk_level: String,
+    recommendation: String,
+    evidence: Vec<String>,
+    conflict_evidence: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -330,6 +363,8 @@ struct PortHistoryEntry {
     pid: u32,
     process_name: String,
     process_path: String,
+    identity: String,
+    risk_level: String,
     observed_at: u64,
 }
 
@@ -840,6 +875,7 @@ struct UpdateManifest {
     version: String,
     date: String,
     notes: Vec<String>,
+    #[serde(alias = "download_url")]
     download_url: String,
     #[serde(default)]
     sha256: String,
@@ -880,6 +916,124 @@ struct RuntimeMeta {
     collection: &'static str,
     link_name: &'static str,
     exe_key: &'static str,
+}
+
+static CONFIRMATION_TOKENS: OnceLock<Mutex<HashMap<String, ConfirmationToken>>> = OnceLock::new();
+
+fn confirmation_tokens() -> &'static Mutex<HashMap<String, ConfirmationToken>> {
+    CONFIRMATION_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[tauri::command]
+fn create_confirmation_token(
+    action_id: String,
+    plan_id: String,
+    risk_level: String,
+    plan_fingerprint: String,
+    triple_confirmed: bool,
+    backup_receipt: Option<String>,
+) -> Result<ConfirmationTokenView, String> {
+    let action_id = validate_confirmation_field(action_id, "action_id")?;
+    let plan_id = validate_confirmation_field(plan_id, "plan_id")?;
+    let risk_level = validate_confirmation_field(risk_level, "risk_level")?;
+    let plan_fingerprint = validate_confirmation_field(plan_fingerprint, "plan_fingerprint")?;
+    if risk_level == "critical" && !triple_confirmed {
+        return Err("极高风险操作必须完成三次确认".to_string());
+    }
+    let now = unix_timestamp();
+    let expires_at = now + 5 * 60;
+    let mut hasher = Sha256::new();
+    hasher.update(action_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(plan_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(plan_fingerprint.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    let token = format!("{:x}", hasher.finalize());
+    let record = ConfirmationToken {
+        token: token.clone(),
+        action_id: action_id.clone(),
+        plan_id: plan_id.clone(),
+        risk_level: risk_level.clone(),
+        plan_fingerprint,
+        backup_receipt,
+        triple_confirmed,
+        created_at: now,
+        expires_at,
+        used: false,
+    };
+    let mut store = confirmation_tokens()
+        .lock()
+        .map_err(|_| "确认 token 存储不可用".to_string())?;
+    store.retain(|_, item| !item.used && item.expires_at >= now);
+    store.insert(token.clone(), record);
+    Ok(ConfirmationTokenView {
+        token,
+        action_id,
+        plan_id,
+        risk_level,
+        expires_at,
+    })
+}
+
+fn validate_confirmation_field(value: String, label: &str) -> Result<String, String> {
+    let value = value.trim().to_string();
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(format!("{label} 无效"));
+    }
+    Ok(value)
+}
+
+fn require_confirmation_token(
+    token: Option<String>,
+    action_id: &str,
+    plan_id: &str,
+    risk_level: &str,
+    plan_fingerprint: &str,
+    backup_required: bool,
+) -> Result<(), String> {
+    let token = token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "缺少后端 confirmation token，已拒绝执行高风险操作".to_string())?;
+    let now = unix_timestamp();
+    let mut store = confirmation_tokens()
+        .lock()
+        .map_err(|_| "确认 token 存储不可用".to_string())?;
+    let record = store
+        .get_mut(&token)
+        .ok_or_else(|| "confirmation token 不存在或已失效".to_string())?;
+    if record.used {
+        return Err("confirmation token 已使用，已拒绝重复执行".to_string());
+    }
+    if record.expires_at < now {
+        record.used = true;
+        return Err("confirmation token 已过期，请重新确认".to_string());
+    }
+    if record.action_id != action_id
+        || record.plan_id != plan_id
+        || record.risk_level != risk_level
+        || record.plan_fingerprint != plan_fingerprint
+    {
+        return Err("confirmation token 与当前计划不匹配".to_string());
+    }
+    if risk_level == "critical" && !record.triple_confirmed {
+        return Err("极高风险操作未完成三次确认".to_string());
+    }
+    if backup_required
+        && record
+            .backup_receipt
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        return Err("该操作需要有效备份回执".to_string());
+    }
+    record.used = true;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1497,7 +1651,7 @@ fn check_for_updates_blocking() -> Result<UpdateCheckResult, String> {
         .map_err(|err| format!("检查更新失败：{err}"))?
         .json()
         .map_err(|err| format!("更新清单格式错误：{err}"))?;
-    validate_download_url(&manifest.download_url)?;
+    validate_update_manifest(&manifest)?;
     let current = env!("CARGO_PKG_VERSION").to_string();
     Ok(UpdateCheckResult {
         update_available: version_key(&manifest.version) > version_key(&current),
@@ -1573,6 +1727,18 @@ fn validate_update_checksum(value: &str) -> Result<(), String> {
     if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return Err("更新清单缺少有效 SHA256，已拒绝下载".to_string());
     }
+    Ok(())
+}
+
+fn validate_update_manifest(manifest: &UpdateManifest) -> Result<(), String> {
+    if manifest.version.trim().is_empty() {
+        return Err("更新清单缺少 version".to_string());
+    }
+    if manifest.download_url.trim().is_empty() {
+        return Err("更新清单缺少 downloadUrl".to_string());
+    }
+    validate_download_url(&manifest.download_url)?;
+    validate_update_checksum(&manifest.sha256)?;
     Ok(())
 }
 
@@ -2861,7 +3027,12 @@ fn uninstall_runtime_blocking(
 }
 
 #[tauri::command]
-fn kill_process(pid: u32, force: bool, allow_caution: bool) -> KillResult {
+fn kill_process(
+    pid: u32,
+    force: bool,
+    allow_caution: bool,
+    confirmation_token: Option<String>,
+) -> KillResult {
     if BLOCKED_PIDS.contains(&pid) {
         return KillResult {
             success: false,
@@ -2885,6 +3056,24 @@ fn kill_process(pid: u32, force: bool, allow_caution: bool) -> KillResult {
         return KillResult {
             success: false,
             message: format!("{name} 需要额外确认"),
+            needs_force: false,
+            blocked: true,
+        };
+    }
+    let risk_level = if force { "critical" } else { "high" };
+    let plan_id = format!("pid-{pid}-force-{force}-allow-{allow_caution}");
+    let fingerprint = process_action_fingerprint("kill_process", &plan_id, risk_level);
+    if let Err(message) = require_confirmation_token(
+        confirmation_token,
+        "kill_process",
+        &plan_id,
+        risk_level,
+        &fingerprint,
+        false,
+    ) {
+        return KillResult {
+            success: false,
+            message,
             needs_force: false,
             blocked: true,
         };
@@ -2926,6 +3115,16 @@ fn kill_process(pid: u32, force: bool, allow_caution: bool) -> KillResult {
             blocked: false,
         },
     }
+}
+
+fn process_action_fingerprint(action_id: &str, plan_id: &str, risk_level: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(action_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(plan_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(risk_level.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[tauri::command]
@@ -2970,9 +3169,18 @@ fn scan_ports_blocking() -> Result<Vec<PortRecord>, String> {
         let (process_path, command_line, parent_pid, parent_process_name) =
             process_details(&system, pid);
         let service_names = services.get(&pid).cloned().unwrap_or_default();
-        let common_usage = port_common_usage(local_port, &process_name);
-        let explanation = port_explanation(local_port, &process_name, &common_usage);
-        let risk = classify_port(local_port, pid, &process_name);
+        let signature = analyze_port_signature(
+            local_port,
+            &state,
+            &process_name,
+            &process_path,
+            &command_line,
+            &service_names,
+        );
+        let command_line = redact_report_text(&command_line);
+        let common_usage = signature.identity.clone();
+        let explanation = signature.explanation.clone();
+        let risk = signature.risk.clone();
 
         records.push(PortRecord {
             protocol,
@@ -2990,6 +3198,14 @@ fn scan_ports_blocking() -> Result<Vec<PortRecord>, String> {
             common_usage,
             explanation,
             risk,
+            identity: signature.identity,
+            confidence: signature.confidence,
+            evidence_count: signature.evidence.len(),
+            conflict_count: signature.conflict_evidence.len(),
+            risk_level: signature.risk_level,
+            recommendation: signature.recommendation,
+            evidence: signature.evidence,
+            conflict_evidence: signature.conflict_evidence,
         });
     }
 
@@ -6088,11 +6304,30 @@ async fn create_mysql_repair_plan(
 }
 
 #[tauri::command]
+fn mysql_pending_execution_guard(
+    plan_id: String,
+) -> Result<mysql_repair::MySqlPendingExecutionGuard, String> {
+    mysql_repair::pending_execution_guard(&plan_id)
+}
+
+#[tauri::command]
 async fn execute_mysql_repair_plan(
     plan_id: String,
     backup_destination: Option<String>,
+    confirmation_token: Option<String>,
 ) -> Result<OperationResult, String> {
     run_blocking(move || {
+        let guard = mysql_repair::pending_execution_guard(&plan_id)?;
+        if guard.risk_level != "low" {
+            require_confirmation_token(
+                confirmation_token,
+                &guard.action_id,
+                &guard.plan_id,
+                &guard.risk_level,
+                &guard.plan_fingerprint,
+                guard.backup_required,
+            )?;
+        }
         mysql_repair::execute(plan_id, backup_destination).map(|message| OperationResult {
             success: true,
             message,
@@ -7661,6 +7896,7 @@ pub fn run() {
             safety_disclaimer,
             feature_risk_registry,
             get_feature_risk,
+            create_confirmation_token,
             accept_safety_disclaimer,
             create_move_plan,
             execute_move_plan,
@@ -7724,6 +7960,7 @@ pub fn run() {
             inspect_local_services,
             inspect_mysql_repair,
             create_mysql_repair_plan,
+            mysql_pending_execution_guard,
             execute_mysql_repair_plan,
             manage_local_service,
             local_service_logs,
@@ -8163,15 +8400,63 @@ fn normalize_root_dir(input: &str) -> Result<PathBuf, String> {
     if raw.is_empty() {
         return Err("根目录不能为空".to_string());
     }
+    if raw.contains('\0') || raw.chars().any(char::is_control) {
+        return Err("根目录不能包含控制字符".to_string());
+    }
     let expanded = PathBuf::from(raw)
         .expand_home()
         .unwrap_or_else(|| PathBuf::from(raw));
     let resolved = expanded.canonicalize().unwrap_or(expanded);
+    validate_root_dir_choice(&resolved)?;
     if is_drive_root(&resolved) {
         Ok(resolved.join(APP_NAME))
     } else {
         Ok(resolved)
     }
+}
+
+fn validate_root_dir_choice(root: &Path) -> Result<(), String> {
+    let value = path_key(&display_path(root));
+    if value.is_empty() {
+        return Err("根目录无效".to_string());
+    }
+    let blocked = [
+        r"c:\windows",
+        r"c:\program files",
+        r"c:\program files (x86)",
+        r"c:\programdata",
+        r"c:\users",
+        r"c:\users\public",
+        r"c:\system volume information",
+    ];
+    if blocked
+        .iter()
+        .any(|item| value == *item || value.starts_with(&format!("{item}\\")))
+    {
+        return Err(
+            "根目录不能放在 Windows、Program Files、ProgramData 或用户根目录等敏感位置".to_string(),
+        );
+    }
+    if let Some(home) = dirs::home_dir() {
+        for child in [
+            "Desktop",
+            "Downloads",
+            "Documents",
+            "Pictures",
+            "Videos",
+            "Music",
+        ] {
+            let sensitive = path_key(&display_path(home.join(child)));
+            if !sensitive.is_empty()
+                && (value == sensitive || value.starts_with(&format!("{sensitive}\\")))
+            {
+                return Err(
+                    "根目录不能放在桌面、下载、文档、图片、视频或音乐等个人数据目录".to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_drive_root(path: &Path) -> bool {
@@ -9823,20 +10108,6 @@ fn process_name(system: &sysinfo::System, pid: u32) -> String {
         })
 }
 
-fn classify_port(port: u16, pid: u32, process_name: &str) -> String {
-    let lower = process_name.to_ascii_lowercase();
-    if pid == 0 || pid == 4 || lower == "system" {
-        "系统保留".to_string()
-    } else if matches!(
-        port,
-        20 | 21 | 22 | 23 | 25 | 53 | 80 | 110 | 135 | 139 | 143 | 443 | 445 | 3389
-    ) {
-        "敏感端口".to_string()
-    } else {
-        "普通".to_string()
-    }
-}
-
 fn classify_source(path: &str) -> String {
     let lower = path.to_ascii_lowercase();
     if lower.contains("\\devenvmanager\\") {
@@ -10058,39 +10329,230 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     values
 }
 
-fn port_common_usage(port: u16, process_name: &str) -> String {
-    let lower = process_name.to_ascii_lowercase();
-    let known = match port {
-        80 => "HTTP Web 服务",
-        443 => "HTTPS Web 服务",
-        1433 => "SQL Server",
-        3000 | 4173 | 5173 | 5174 => "前端开发服务",
-        3306 => "MySQL",
-        5432 => "PostgreSQL",
-        6379 => "Redis",
-        8005 | 8009 | 8443 => "Tomcat",
-        8000 => "常见 Web 开发服务",
-        8080..=8082 => "Spring Boot / Tomcat / Web 服务",
-        8761 => "Spring Cloud Eureka",
-        8888 => "Jupyter / Spring Config",
-        9200 => "Elasticsearch",
-        27017 => "MongoDB",
-        _ if lower.contains("java") => "Java 应用",
-        _ if lower.contains("node") => "Node.js 应用",
-        _ if lower.contains("python") => "Python 应用",
-        _ => "未识别的本地服务",
-    };
-    known.to_string()
+#[derive(Debug, Clone)]
+struct PortSignature {
+    identity: String,
+    confidence: u8,
+    evidence: Vec<String>,
+    conflict_evidence: Vec<String>,
+    risk: String,
+    risk_level: String,
+    recommendation: String,
+    explanation: String,
 }
 
-fn port_explanation(port: u16, process_name: &str, usage: &str) -> String {
-    let lower = process_name.to_ascii_lowercase();
-    if matches!(port, 8080..=8082) && lower.contains("java") {
-        "可能是 Spring Boot、Tomcat，或 IDE 启动的 Java Web 服务。".to_string()
-    } else if matches!(port, 3000 | 4173 | 5173 | 5174) && lower.contains("node") {
-        "可能是 Vite、Next.js、React/Vue 开发服务器或其他 Node.js 服务。".to_string()
+fn analyze_port_signature(
+    port: u16,
+    state: &str,
+    process_name: &str,
+    process_path: &str,
+    command_line: &str,
+    service_names: &[String],
+) -> PortSignature {
+    let lower_name = process_name.to_ascii_lowercase();
+    let haystack = format!(
+        "{} {} {} {}",
+        lower_name,
+        process_path.to_ascii_lowercase(),
+        command_line.to_ascii_lowercase(),
+        service_names.join(" ").to_ascii_lowercase()
+    );
+    let mut evidence = Vec::new();
+    let mut conflict = Vec::new();
+    let mut identity = "未识别的本地服务".to_string();
+    let mut score = 0_i32;
+
+    let signatures: &[(&str, &[&str], &str)] = &[
+        (
+            "Spring Boot",
+            &["spring-boot", "org.springframework.boot", "bootrun"],
+            "Java / JVM",
+        ),
+        (
+            "Tomcat",
+            &["tomcat", "catalina", "org.apache.catalina"],
+            "Java / JVM",
+        ),
+        (
+            "Java / JVM",
+            &["java.exe", "\\jdk", "\\jre", "java -jar"],
+            "Java / JVM",
+        ),
+        ("Maven", &["mvn.cmd", "maven"], "Java / JVM"),
+        ("Gradle", &["gradle", "gradlew"], "Java / JVM"),
+        (
+            "Node.js",
+            &["node.exe", "\\nodejs\\", "npm", "pnpm", "yarn"],
+            "Node / 前端",
+        ),
+        ("Vite", &["vite", "vite.config"], "Node / 前端"),
+        ("Next.js", &["next dev", "next-server"], "Node / 前端"),
+        (
+            "Python",
+            &[
+                "python.exe",
+                "\\python",
+                "uvicorn",
+                "gunicorn",
+                "flask",
+                "django",
+            ],
+            "Python / AI",
+        ),
+        (
+            "Jupyter",
+            &["jupyter", "ipykernel", "notebook"],
+            "Python / AI",
+        ),
+        ("Go", &["go.exe", "\\go\\bin", ".go"], "Go / Rust / .NET"),
+        (
+            "Rust",
+            &["cargo.exe", "target\\debug", "target\\release"],
+            "Go / Rust / .NET",
+        ),
+        (
+            ".NET",
+            &["dotnet.exe", "iisexpress", "kestrel"],
+            "Go / Rust / .NET",
+        ),
+        ("PHP", &["php.exe", "php-cgi", "phpstudy"], "PHP / Ruby"),
+        ("Ruby", &["ruby.exe", "rails", "puma"], "PHP / Ruby"),
+        ("MySQL / MariaDB", &["mysqld", "mysql", "mariadb"], "数据库"),
+        ("PostgreSQL", &["postgres", "postmaster"], "数据库"),
+        ("Redis", &["redis-server"], "数据库"),
+        ("MongoDB", &["mongod"], "数据库"),
+        ("Elasticsearch", &["elasticsearch"], "数据库"),
+        ("SQL Server", &["sqlservr", "mssql"], "数据库"),
+        ("Nginx", &["nginx.exe", "\\nginx\\"], "Web 服务器"),
+        ("Apache HTTPD", &["httpd.exe", "apache"], "Web 服务器"),
+        ("RabbitMQ", &["rabbitmq", "beam.smp"], "中间件"),
+        ("Kafka", &["kafka", "zookeeper"], "中间件"),
+        (
+            "Docker / Container",
+            &["docker", "com.docker", "containerd"],
+            "Docker / WSL",
+        ),
+        ("WSL", &["wsl", "\\wsl$"], "Docker / WSL"),
+        (
+            "本地代理",
+            &["clash", "v2ray", "sing-box", "mihomo", "privoxy"],
+            "本地代理",
+        ),
+        (
+            "IDE / 调试器",
+            &["idea64", "pycharm", "webstorm", "code.exe", "debug"],
+            "IDE / 调试器",
+        ),
+        (
+            "桌面应用",
+            &[
+                "steam.exe",
+                "qq.exe",
+                "wechat.exe",
+                "chrome.exe",
+                "msedge.exe",
+                "webview",
+            ],
+            "桌面应用",
+        ),
+    ];
+    for (label, markers, group) in signatures {
+        let hits = markers
+            .iter()
+            .filter(|marker| haystack.contains(&marker.to_ascii_lowercase()))
+            .count();
+        if hits > 0 {
+            score += (hits as i32) * 25;
+            identity = (*label).to_string();
+            evidence.push(format!(
+                "{group} 强证据：{label} 命中 {hits} 个进程/路径/命令行标记"
+            ));
+        }
+    }
+
+    if !state.eq_ignore_ascii_case("LISTENING") {
+        conflict.push(format!("{state} 不是本地监听状态，不能当作正在提供服务"));
+        score -= 25;
+    }
+    if [
+        "steam.exe",
+        "qq.exe",
+        "wechat.exe",
+        "chrome.exe",
+        "msedge.exe",
+    ]
+    .iter()
+    .any(|name| lower_name == *name)
+    {
+        conflict.push("桌面/浏览器进程只按实际进程识别，不按端口号猜测为 Web 框架".to_string());
+        score -= 20;
+    }
+    let port_hint = match port {
+        80 => Some("HTTP Web 服务"),
+        443 => Some("HTTPS Web 服务"),
+        1433 => Some("SQL Server"),
+        3000 | 4173 | 5173 | 5174 => Some("前端开发服务"),
+        3306 => Some("MySQL"),
+        5432 => Some("PostgreSQL"),
+        6379 => Some("Redis"),
+        8005 | 8009 | 8443 => Some("Tomcat"),
+        8000 => Some("常见 Web 开发服务"),
+        8080..=8082 => Some("Spring Boot / Tomcat / Web 服务"),
+        8761 => Some("Spring Cloud Eureka"),
+        8888 => Some("Jupyter / Spring Config"),
+        9200 => Some("Elasticsearch"),
+        27017 => Some("MongoDB"),
+        _ => None,
+    };
+    if let Some(hint) = port_hint {
+        evidence.push(format!("弱证据：端口 {port} 常见于 {hint}"));
+        if identity == "未识别的本地服务" && state.eq_ignore_ascii_case("LISTENING") {
+            identity = format!("{hint}（仅端口弱证据）");
+        }
+        score += 8;
+    }
+
+    let confidence = score.clamp(0, 100) as u8;
+    let risk_level = if !state.eq_ignore_ascii_case("LISTENING") {
+        "low"
+    } else if matches!(port, 3306 | 5432 | 6379 | 27017 | 9200 | 1433) {
+        "high"
+    } else if matches!(port, 80 | 443 | 8080..=8082 | 8000 | 8888) {
+        "medium"
     } else {
-        format!("该端口通常用于{usage}；结束前请确认对应项目不再需要。")
+        "low"
+    }
+    .to_string();
+    let risk = match risk_level.as_str() {
+        "high" => "敏感服务",
+        "medium" => "需确认",
+        _ => "普通",
+    }
+    .to_string();
+    let recommendation = if !state.eq_ignore_ascii_case("LISTENING") {
+        "这是已有连接记录，优先确认远端地址，不建议结束进程。"
+    } else if confidence < 40 {
+        "识别证据不足，先打开进程位置或查看详情再操作。"
+    } else if risk_level == "high" {
+        "疑似数据库/中间件等敏感服务，结束前先确认项目、备份和连接用户。"
+    } else {
+        "如确认对应项目已停止使用，可从详情中执行安全结束。"
+    }
+    .to_string();
+    let explanation = format!(
+        "{identity}；置信度 {confidence}%；强/弱证据 {} 条，冲突证据 {} 条。",
+        evidence.len(),
+        conflict.len()
+    );
+    PortSignature {
+        identity,
+        confidence,
+        evidence,
+        conflict_evidence: conflict,
+        risk,
+        risk_level,
+        recommendation,
+        explanation,
     }
 }
 
@@ -10119,7 +10581,9 @@ fn update_port_history(records: &[PortRecord]) -> Result<(), String> {
                 protocol: record.protocol.clone(),
                 pid: record.pid,
                 process_name: record.process_name.clone(),
-                process_path: record.process_path.clone(),
+                process_path: redact_report_text(&record.process_path),
+                identity: record.identity.clone(),
+                risk_level: record.risk_level.clone(),
                 observed_at: now,
             });
         }
@@ -11468,7 +11932,11 @@ fn unix_timestamp() -> u64 {
 }
 
 fn display_path(path: impl AsRef<Path>) -> String {
-    path.as_ref().display().to_string()
+    path.as_ref()
+        .display()
+        .to_string()
+        .trim_start_matches("\\\\?\\")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -11697,6 +12165,80 @@ mod tests {
         assert!(validate_download_url("https://download.bell-sw.com/java/21/file.zip").is_ok());
         assert!(validate_download_url("https://example.com/file.zip").is_err());
         assert!(validate_download_url("http://go.dev/dl/file.zip").is_err());
+    }
+
+    #[test]
+    fn update_manifest_accepts_camel_and_snake_download_url() {
+        let camel: UpdateManifest = serde_json::from_value(json!({
+            "version": "1.5.2",
+            "date": "2026-06-27",
+            "notes": ["patch"],
+            "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.5.2/DevEnv.Manager_1.5.2_x64-setup.exe",
+            "sha256": "a".repeat(64)
+        }))
+        .unwrap();
+        validate_update_manifest(&camel).unwrap();
+        let snake: UpdateManifest = serde_json::from_value(json!({
+            "version": "1.5.2",
+            "date": "2026-06-27",
+            "notes": ["patch"],
+            "download_url": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.5.2/DevEnv.Manager_1.5.2_x64-setup.exe",
+            "sha256": "b".repeat(64)
+        }))
+        .unwrap();
+        assert_eq!(snake.download_url, camel.download_url);
+        validate_update_manifest(&snake).unwrap();
+    }
+
+    #[test]
+    fn confirmation_token_is_bound_and_single_use() {
+        let plan_id = format!("test-plan-{}", unix_timestamp());
+        let fingerprint = process_action_fingerprint("kill_process", &plan_id, "high");
+        let token = create_confirmation_token(
+            "kill_process".to_string(),
+            plan_id.clone(),
+            "high".to_string(),
+            fingerprint.clone(),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(require_confirmation_token(
+            Some(token.token.clone()),
+            "kill_process",
+            &plan_id,
+            "high",
+            &fingerprint,
+            false,
+        )
+        .is_ok());
+        assert!(require_confirmation_token(
+            Some(token.token),
+            "kill_process",
+            &plan_id,
+            "high",
+            &fingerprint,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn desktop_process_not_classified_as_spring_by_port_only() {
+        let signature = analyze_port_signature(
+            8080,
+            "LISTENING",
+            "steam.exe",
+            r"C:\Program Files (x86)\Steam\steam.exe",
+            r#""C:\Program Files (x86)\Steam\steam.exe""#,
+            &[],
+        );
+        assert_eq!(signature.identity, "桌面应用");
+        assert!(signature
+            .conflict_evidence
+            .iter()
+            .any(|item| item.contains("桌面/浏览器")));
+        assert!(!signature.identity.contains("Spring"));
     }
 
     #[test]

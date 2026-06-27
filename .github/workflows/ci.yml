@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  quality:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tauri/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Rust tests
+        working-directory: tauri/src-tauri
+        run: cargo test --all-targets
+
+      - name: Rust clippy
+        working-directory: tauri/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Frontend dependencies
+        working-directory: tauri
+        run: npm ci
+
+      - name: Frontend build
+        working-directory: tauri
+        run: npm run build
+
+      - name: Safety wording
+        run: python scripts/check_safety_wording.py
+
+      - name: Repository hygiene
+        run: python scripts/check_repo_hygiene.py

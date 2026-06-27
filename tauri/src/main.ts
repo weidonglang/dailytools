@@ -272,6 +272,14 @@ type PortRecord = {
   commonUsage: string;
   explanation: string;
   risk: string;
+  identity: string;
+  confidence: number;
+  evidenceCount: number;
+  conflictCount: number;
+  riskLevel: string;
+  recommendation: string;
+  evidence: string[];
+  conflictEvidence: string[];
 };
 
 type PortHistorySummary = {
@@ -588,6 +596,10 @@ type MySqlCandidate = {
   port: number;
   portOccupied: boolean;
   dataHealth: string;
+  confidence: string;
+  conclusionLevel: string;
+  evidence: string[];
+  nextSteps: string[];
   systemSchemaMissing: boolean;
   businessDatabases: string[];
   lastError: string;
@@ -614,6 +626,25 @@ type MySqlRepairPlan = {
   warnings: string[];
   requiresAdmin: boolean;
   requiresBackup: boolean;
+  riskLevel: string;
+  planFingerprint: string;
+};
+
+type ConfirmationTokenView = {
+  token: string;
+  actionId: string;
+  planId: string;
+  riskLevel: string;
+  expiresAt: number;
+};
+
+type MySqlExecutionGuard = {
+  actionId: string;
+  planId: string;
+  riskLevel: string;
+  planFingerprint: string;
+  backupRequired: boolean;
+  backupReceipt?: string;
 };
 
 type JdkDistribution = {
@@ -2982,14 +3013,22 @@ async function terminatePortProcess(pid: number) {
   const label = record ? `${record.processName} / PID ${pid}` : `PID ${pid}`;
   if (!window.confirm(`将结束 ${label} 及其子进程。确定继续吗？`)) return;
   try {
-    let result = await invoke<KillResult>("kill_process", { pid, force: false, allowCaution: false });
+    const planId = `pid-${pid}-force-false-allow-false`;
+    const fingerprint = await processActionFingerprint("kill_process", planId, "high");
+    const token = await createBackendConfirmation("kill_process", planId, "high", fingerprint, false);
+    let result = await invoke<KillResult>("kill_process", { pid, force: false, allowCaution: false, confirmationToken: token.token });
     if (result.needsForce) {
       const force = window.confirm(`${result.message}\n\n是否改为强制结束？`);
       if (!force) {
         showToast("已取消强制结束");
         return;
       }
-      result = await invoke<KillResult>("kill_process", { pid, force: true, allowCaution: false });
+      if (!window.confirm("强制结束是极高风险操作。第一次确认：我已保存相关工作。")) return;
+      if (!window.confirm("第二次确认：我理解这可能导致数据未保存或服务中断。")) return;
+      const forcePlanId = `pid-${pid}-force-true-allow-false`;
+      const forceFingerprint = await processActionFingerprint("kill_process", forcePlanId, "critical");
+      const forceToken = await createBackendConfirmation("kill_process", forcePlanId, "critical", forceFingerprint, true);
+      result = await invoke<KillResult>("kill_process", { pid, force: true, allowCaution: false, confirmationToken: forceToken.token });
     }
     showToast(result.message, !result.success);
     state.ports = await invoke<PortRecord[]>("scan_ports");
@@ -3376,6 +3415,34 @@ function renderEnvironmentBackups() {
   element.innerHTML = state.environmentBackups.length
     ? paginate("environment-backups", state.environmentBackups, (backup) => `<article class="runtime"><div><strong>${escapeHtml(backup.fileName)}</strong><span>${backup.pathEntries} 个 PATH 条目</span></div><small>DEVENV_HOME：${escapeHtml(backup.devenvHome || "未设置")} · JAVA_HOME：${escapeHtml(backup.javaHome || "未设置")}</small><div class="row-actions"><button data-restore-env-backup="${escapeHtml(backup.fileName)}">恢复此备份</button></div></article>`)
     : `<div class="empty">还没有环境备份；首次应用配置时会自动创建</div>`;
+}
+
+async function sha256Hex(text: string) {
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function createBackendConfirmation(
+  actionId: string,
+  planId: string,
+  riskLevel: string,
+  planFingerprint: string,
+  tripleConfirmed: boolean,
+  backupReceipt?: string | null,
+) {
+  return invoke<ConfirmationTokenView>("create_confirmation_token", {
+    actionId,
+    planId,
+    riskLevel,
+    planFingerprint,
+    tripleConfirmed,
+    backupReceipt: backupReceipt || null,
+  });
+}
+
+async function processActionFingerprint(actionId: string, planId: string, riskLevel: string) {
+  return sha256Hex(`${actionId}\0${planId}\0${riskLevel}`);
 }
 
 function renderSafetyDisclaimer() {
@@ -4648,7 +4715,29 @@ document.addEventListener("click", (event) => {
     void (async () => {
       showToast(guideOnly ? "正在生成安全向导" : "正在执行 MySQL 修复计划");
       try {
-        const result = await invoke<OperationResult>("execute_mysql_repair_plan", { planId: plan.planId, backupDestination });
+        let confirmationToken: string | null = null;
+        if (!guideOnly) {
+          const guard = await invoke<MySqlExecutionGuard>("mysql_pending_execution_guard", { planId: plan.planId });
+          if (guard.riskLevel === "critical") {
+            if (!window.confirm("第一次确认：MySQL 系统库修复前必须已完成完整 Data 备份。")) return;
+            if (!window.confirm("第二次确认：我理解该操作可能影响数据库服务启动和业务库恢复。")) return;
+            const phrase = window.prompt("第三次确认：请输入“我已知晓 MySQL 修复风险并确认执行”");
+            if (phrase !== "我已知晓 MySQL 修复风险并确认执行") {
+              showToast("三次确认文本不匹配，已取消", true);
+              return;
+            }
+          }
+          const token = await createBackendConfirmation(
+            guard.actionId,
+            guard.planId,
+            guard.riskLevel,
+            guard.planFingerprint,
+            guard.riskLevel === "critical",
+            guard.backupReceipt || null,
+          );
+          confirmationToken = token.token;
+        }
+        const result = await invoke<OperationResult>("execute_mysql_repair_plan", { planId: plan.planId, backupDestination, confirmationToken });
         if (guideOnly) {
           const output = document.querySelector<HTMLElement>("#local-service-logs");
           if (output) output.textContent = result.message;
