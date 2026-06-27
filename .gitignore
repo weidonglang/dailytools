@@ -22,3 +22,6 @@ tauri/src-tauri/gen/
 *.log
 *.tmp
 
+# Local release upload staging
+release-assets-v*/
+

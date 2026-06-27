@@ -1,6 +1,6 @@
 [package]
 name = "dailytools-tauri"
-version = "1.5.0"
+version = "1.5.1"
 description = "A lightweight Tauri rewrite of DevEnv Manager."
 authors = ["weidonglang"]
 edition = "2021"
@@ -28,6 +28,7 @@ tauri = { version = "2.11.3", features = [] }
 sysinfo = "0.39.3"
 trash = "5.2"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+tauri-plugin-dialog = "2.7.1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

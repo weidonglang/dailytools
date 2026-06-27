@@ -1,21 +1,21 @@
-# DevEnv Manager 1.5 操作手册
+# DevEnv Manager 1.5.1 Final Stable 操作手册
 
-本手册适用于 Windows 10/11 上的 DevEnv Manager 1.5。程序定位是开发环境诊断器与安全操作面板，不替代 npm、pnpm、pip、uv、Maven、Gradle、Cargo、chsrc、Scoop、Chocolatey、WSL 等成熟工具。
+本手册适用于 Windows 10/11 上的 DevEnv Manager 1.5.1。程序定位是开发环境诊断器与安全操作面板，不替代 npm、pnpm、pip、uv、Maven、Gradle、Cargo、chsrc、Scoop、Chocolatey、WSL 等成熟工具。
 
 ## 1. 下载、安装与校验
 
 只从项目的 GitHub Releases 页面下载安装包。发布页同时提供：
 
-- `DevEnv.Manager_1.5.0_x64-setup.exe`：推荐安装包。
-- `DevEnv.Manager_1.5.0_x64_en-US.msi`：MSI 安装包。
+- `DevEnv.Manager_1.5.1_x64-setup.exe`：推荐安装包。
+- `DevEnv.Manager_1.5.1_x64_en-US.msi`：MSI 安装包。
 - `devenv.exe`：命令行工具。
 - `SHA256SUMS.txt`：文件校验值。
 
 PowerShell 校验示例：
 
 ```powershell
-Get-FileHash .\DevEnv.Manager_1.5.0_x64-setup.exe -Algorithm SHA256
-Get-FileHash .\DevEnv.Manager_1.5.0_x64_en-US.msi -Algorithm SHA256
+Get-FileHash .\DevEnv.Manager_1.5.1_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\DevEnv.Manager_1.5.1_x64_en-US.msi -Algorithm SHA256
 Get-FileHash .\devenv.exe -Algorithm SHA256
 ```
 
@@ -74,7 +74,23 @@ Get-FileHash .\devenv.exe -Algorithm SHA256
 4. 计划会展示准确的 Python 路径、`ensurepip`/pip 命令、PATH 新增项和备份名称；计划 10 分钟过期且只能使用一次。
 5. 二次确认后，程序先保存环境备份，再执行 pip 修复和 PATH 写入，最后用同一个 Python 回读 `python -m pip --version`。
 
-修复不会卸载其他 Python，也不会自动关闭 Microsoft Store 执行别名。Store 别名需在 Windows“管理应用执行别名”中由用户处理。1.5 会明确提示 `pip.exe` 不一定属于当前 `python.exe`，推荐使用 `python -m pip`。Windows 命令输出会按 UTF-16、UTF-8 与当前系统代码页依次解码，减少中文 CMD 乱码；SHA-256 文本只接受与目标文件名匹配的 64 位十六进制值。
+修复不会卸载其他 Python，也不会自动关闭 Microsoft Store 执行别名。Store 别名需在 Windows“管理应用执行别名”中由用户处理。1.5.1 会明确提示 `pip.exe` 不一定属于当前 `python.exe`，推荐使用 `python -m pip`。Windows 命令输出会按 UTF-16、UTF-8 与当前系统代码页依次解码，减少中文 CMD 乱码；SHA-256 文本只接受与目标文件名匹配的 64 位十六进制值。
+
+### Python 完整性检查
+
+安装受管 Python 后会检查：
+
+- `python --version`
+- `python -c "import sys; print(sys.executable)"`
+- `python -m pip --version`
+- `python -m venv --help`
+- `ssl`
+- `sqlite3`
+- `ctypes`
+- `tkinter`（可选）
+- `Scripts\pip.exe`
+
+`pip`、`venv`、`ssl`、`sqlite3`、`ctypes` 是核心检查。核心组件失败时不会登记为已安装；`tkinter` 失败会提示 GUI 相关库可能不可用。受管 Python 缺少 pip 时可生成修复计划，计划会显示 `ensurepip` 与 pip 升级命令。非受管 Python 只提示问题，不替用户修改系统安装。
 
 ## 4. 版本安装与切换
 
@@ -96,7 +112,7 @@ Get-FileHash .\devenv.exe -Algorithm SHA256
 
 ## 5. 项目分析与配置生成
 
-1. 在“项目”页填写项目根目录并点击“分析”。
+1. 在“项目”页点击“选择文件夹”，或填写项目根目录并点击“分析”。
 2. 确认识别到的项目类型、配置文件、运行时要求和固定操作。
 3. 点击“生成 VS Code / IDEA 配置预览”。
 4. 在预览面板选择要写入的文件，并按需微调内容。
@@ -111,6 +127,21 @@ Get-FileHash .\devenv.exe -Algorithm SHA256
 - 已有文件备份到 `.devenv-manager/backups/<时间戳>/`。
 - 切换运行时前自动创建“自动备份 项目切换 <时间戳>”环境模板。
 - 任一运行时切换失败时，程序会尝试恢复项目文件和切换前环境模板。
+
+### IDEA / IntelliJ 配置只读分析
+
+点击“只读读取 IDEA 配置”后，程序只读取：
+
+- `.idea/misc.xml`
+- `.idea/modules.xml`
+- `.idea/compiler.xml`
+- `*.iml`
+
+如果存在 `.idea/workspace.xml`，只提示它存在，不全量导出最近文件、历史路径、token、密码或私人配置。分析结果会展示 Project SDK、language level、模块 SDK、Maven importer JDK、Gradle JVM、编译目标和当前 `JAVA_HOME` 是否大致匹配。程序不会自动修改 `.idea`。
+
+### Nacos / Nexus / Maven / Gradle Java 验证
+
+项目页可以验证 Nacos 或 Nexus 会看到的 Java 环境。验证会读取最新 Windows 用户环境，展开 `JAVA_HOME`，检查 `java.exe`、`javac.exe`、PATH 首个 Java、间接引用风险，以及当前进程环境是否落后。Maven、Gradle、Spring Boot bat/cmd 脚本也会使用同一套解释口径。
 
 ## 6. 镜像与 chsrc
 

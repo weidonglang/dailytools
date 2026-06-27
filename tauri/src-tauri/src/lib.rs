@@ -506,6 +506,101 @@ struct PythonRepairPlan {
     backup_name: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ValidationCheck {
+    id: String,
+    title: String,
+    success: bool,
+    required: bool,
+    detail: String,
+    stage: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PythonIntegrityReport {
+    python_path: String,
+    python_home: String,
+    managed: bool,
+    fully_usable: bool,
+    status: String,
+    checks: Vec<ValidationCheck>,
+    risks: Vec<String>,
+    suggestions: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeStrongStatus {
+    kind: String,
+    version: String,
+    path: String,
+    registered: bool,
+    current: bool,
+    environment_effective: bool,
+    status: String,
+    checks: Vec<ValidationCheck>,
+    failure_stage: Option<String>,
+    report: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeStrongVerificationReport {
+    generated_at: String,
+    items: Vec<RuntimeStrongStatus>,
+    summary: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct IdeaProjectReport {
+    root: String,
+    detected: bool,
+    read_files: Vec<String>,
+    project_sdk: String,
+    language_level: String,
+    module_sdks: Vec<String>,
+    module_count: usize,
+    compiler_target: String,
+    maven_importer_jdk: String,
+    gradle_jvm: String,
+    output_dir: String,
+    current_java_home: String,
+    current_java_version: String,
+    jdk_match: String,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct JavaConsumerReport {
+    consumer: String,
+    root: String,
+    startup_exists: bool,
+    java_home_raw: Option<String>,
+    java_home_expanded: Option<String>,
+    java_exists: bool,
+    javac_exists: bool,
+    path_java: Option<String>,
+    indirect_java_home_risk: bool,
+    process_user_env_differs: bool,
+    usable: bool,
+    explanation: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryValidationResult {
+    path: String,
+    exists: bool,
+    is_directory: bool,
+    recognized_project: bool,
+    signals: Vec<String>,
+    message: String,
+}
+
 #[derive(Clone)]
 struct PendingPythonRepair {
     public: PythonRepairPlan,
@@ -779,7 +874,7 @@ struct TaskProgress {
     message: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct RuntimeMeta {
     kind: &'static str,
     collection: &'static str,
@@ -1939,6 +2034,258 @@ fn discover_runtimes_blocking() -> Vec<RuntimeInfo> {
 }
 
 #[tauri::command]
+fn inspect_runtime_strong_verification() -> Result<RuntimeStrongVerificationReport, String> {
+    let paths = load_paths()?;
+    let installed = load_installed(&paths)?;
+    let mut items = Vec::new();
+    for kind in ["jdk", "python", "node", "maven", "gradle", "go"] {
+        let meta = runtime_meta(kind)?;
+        for record in collection(&installed, meta.collection) {
+            items.push(verify_registered_runtime(&paths, &installed, meta, record));
+        }
+    }
+    let summary = vec![
+        "目录存在只代表文件夹存在；版本命令通过才代表基本能运行。".to_string(),
+        "组件检查通过才代表开发所需组件完整；环境生效还需要 current 指针和用户 PATH/JAVA_HOME 命中。"
+            .to_string(),
+        "组件缺失不会显示为完全可用。".to_string(),
+    ];
+    Ok(RuntimeStrongVerificationReport {
+        generated_at: current_timestamp(),
+        items,
+        summary,
+    })
+}
+
+fn current_version_for_kind<'a>(installed: &'a InstalledData, kind: &str) -> Option<&'a str> {
+    match kind {
+        "jdk" => installed.current.jdk.as_deref(),
+        "python" => installed.current.python.as_deref(),
+        "node" => installed.current.node.as_deref(),
+        "maven" => installed.current.maven.as_deref(),
+        "gradle" => installed.current.gradle.as_deref(),
+        "go" => installed.current.go.as_deref(),
+        _ => None,
+    }
+}
+
+fn verify_registered_runtime(
+    paths: &AppPaths,
+    installed: &InstalledData,
+    meta: RuntimeMeta,
+    record: &Value,
+) -> RuntimeStrongStatus {
+    let version = record
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let root = record
+        .get("path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let executable = record
+        .get(meta.exe_key)
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let current = current_version_for_kind(installed, meta.kind) == Some(version.as_str());
+    let mut checks = Vec::new();
+    checks.push(ValidationCheck {
+        id: "directory".to_string(),
+        title: "目录存在".to_string(),
+        success: root.is_dir(),
+        required: true,
+        detail: display_path(&root),
+        stage: "DirectoryInvalid".to_string(),
+    });
+    checks.push(ValidationCheck {
+        id: "executable".to_string(),
+        title: "可执行文件存在".to_string(),
+        success: executable.is_file(),
+        required: true,
+        detail: display_path(&executable),
+        stage: "ExecutableMissing".to_string(),
+    });
+    match meta.kind {
+        "jdk" => {
+            checks.push(validation_check(
+                "java",
+                "java -version",
+                true,
+                "PostInstallVerify",
+                run_command_output(root.join("bin/java.exe"), &["-version"], 30),
+            ));
+            checks.push(validation_check(
+                "javac",
+                "javac -version",
+                true,
+                "PostInstallVerify",
+                run_command_output(root.join("bin/javac.exe"), &["-version"], 30),
+            ));
+            checks.push(validation_check(
+                "jar",
+                "jar --help",
+                true,
+                "ComponentMissing",
+                run_command_output(root.join("bin/jar.exe"), &["--help"], 30),
+            ));
+        }
+        "python" => {
+            let report = python_integrity_for_path(&executable, paths);
+            checks.extend(report.checks);
+        }
+        "node" => {
+            checks.push(validation_check(
+                "node",
+                "node -v",
+                true,
+                "PostInstallVerify",
+                run_command_output(root.join("node.exe"), &["-v"], 30),
+            ));
+            checks.push(validation_check(
+                "npm",
+                "npm -v",
+                true,
+                "ComponentMissing",
+                run_command_output(root.join("npm.cmd"), &["-v"], 30),
+            ));
+            checks.push(validation_check(
+                "npx",
+                "npx -v",
+                true,
+                "ComponentMissing",
+                run_command_output(root.join("npx.cmd"), &["-v"], 30),
+            ));
+            checks.push(validation_check(
+                "corepack",
+                "corepack --version",
+                false,
+                "OptionalComponentMissing",
+                run_command_output(root.join("corepack.cmd"), &["--version"], 30),
+            ));
+        }
+        "maven" => {
+            checks.push(validation_check(
+                "mvn",
+                "mvn -version",
+                true,
+                "PostInstallVerify",
+                run_command_output(root.join("bin/mvn.cmd"), &["-version"], 60),
+            ));
+        }
+        "gradle" => {
+            checks.push(validation_check(
+                "gradle",
+                "gradle -version",
+                true,
+                "PostInstallVerify",
+                run_command_output(root.join("bin/gradle.bat"), &["--version"], 60),
+            ));
+        }
+        "go" => {
+            checks.push(validation_check(
+                "go",
+                "go version",
+                true,
+                "PostInstallVerify",
+                run_command_output(root.join("bin/go.exe"), &["version"], 30),
+            ));
+            checks.push(validation_check(
+                "goroot",
+                "go env GOROOT",
+                true,
+                "PostInstallVerify",
+                run_command_output(root.join("bin/go.exe"), &["env", "GOROOT"], 30),
+            ));
+            checks.push(validation_check(
+                "gopath",
+                "go env GOPATH",
+                false,
+                "PostInstallVerify",
+                run_command_output(root.join("bin/go.exe"), &["env", "GOPATH"], 30),
+            ));
+            checks.push(validation_check(
+                "goproxy",
+                "go env GOPROXY",
+                false,
+                "PostInstallVerify",
+                run_command_output(root.join("bin/go.exe"), &["env", "GOPROXY"], 30),
+            ));
+        }
+        _ => {}
+    }
+    let user = user_environment().unwrap_or_default();
+    let path_value = user
+        .get("Path")
+        .or_else(|| user.get("PATH"))
+        .cloned()
+        .unwrap_or_default();
+    let environment_effective = match meta.kind {
+        "jdk" => user
+            .get("JAVA_HOME")
+            .map(|value| {
+                path_key(&expand_environment_path(value, paths)) == path_key(&display_path(&root))
+            })
+            .unwrap_or(false),
+        "python" => find_in_configured_path("python", &path_value, paths)
+            .map(|path| is_path_inside(&path, &root))
+            .unwrap_or(false),
+        "node" => find_in_configured_path("node", &path_value, paths)
+            .map(|path| is_path_inside(&path, &root))
+            .unwrap_or(false),
+        "maven" => find_in_configured_path("mvn", &path_value, paths)
+            .map(|path| is_path_inside(&path, &root))
+            .unwrap_or(false),
+        "gradle" => find_in_configured_path("gradle", &path_value, paths)
+            .map(|path| is_path_inside(&path, &root))
+            .unwrap_or(false),
+        "go" => find_in_configured_path("go", &path_value, paths)
+            .map(|path| is_path_inside(&path, &root))
+            .unwrap_or(false),
+        _ => false,
+    };
+    let required_ok = checks
+        .iter()
+        .filter(|item| item.required)
+        .all(|item| item.success);
+    let failure_stage = checks
+        .iter()
+        .find(|item| item.required && !item.success)
+        .map(|item| item.stage.clone());
+    let status = if !root.exists() {
+        "已登记但目录不存在"
+    } else if !executable.is_file() {
+        "已登记但不可用"
+    } else if !required_ok {
+        "组件缺失"
+    } else if current && environment_effective {
+        "当前生效"
+    } else if current {
+        "已安装但环境未生效"
+    } else {
+        "可用"
+    }
+    .to_string();
+    RuntimeStrongStatus {
+        kind: meta.kind.to_string(),
+        version,
+        path: display_path(root),
+        registered: true,
+        current,
+        environment_effective,
+        status,
+        checks,
+        failure_stage,
+        report: vec![
+            "安装失败不会写入 installed.json；本报告只检查已登记记录。".to_string(),
+            "current 指针和环境生效是独立状态，请重新打开终端/IDE 后验证。".to_string(),
+        ],
+    }
+}
+
+#[tauri::command]
 async fn install_jdk(
     app: tauri::AppHandle,
     version: String,
@@ -1986,10 +2333,15 @@ fn install_jdk_blocking(
         Some((&app, &task, 18, 68)),
     )?;
     emit_task_progress(&app, &task, 70, "正在解压 JDK");
-    install_zip_payload(&archive, &target, &["bin/java.exe", "bin/javac.exe"])?;
+    install_zip_payload(
+        &archive,
+        &target,
+        &["bin/java.exe", "bin/javac.exe", "bin/jar.exe"],
+    )?;
     emit_task_progress(&app, &task, 88, "正在验证 JDK");
     let output = run_command_output(target.join("bin/java.exe"), &["-version"], 30)?;
     run_command_output(target.join("bin/javac.exe"), &["-version"], 30)?;
+    run_command_output(target.join("bin/jar.exe"), &["--help"], 30)?;
     record_install(
         &paths,
         runtime_meta("jdk")?,
@@ -2209,9 +2561,21 @@ fn install_python_blocking(
         180,
     )?;
     run_command_output(python_exe.clone(), &["-m", "venv", "--help"], 60)?;
-    emit_task_progress(&app, &task, 88, "正在验证 Python 和 pip");
+    emit_task_progress(&app, &task, 88, "正在验证 Python 完整性");
+    let integrity = python_integrity_for_path(&python_exe, &paths);
+    if !integrity.fully_usable {
+        let failed = integrity
+            .checks
+            .iter()
+            .filter(|item| item.required && !item.success)
+            .map(|item| format!("{}：{}", item.title, item.detail))
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!(
+            "Python 组件完整性检查失败，未写入 installed.json：{failed}"
+        ));
+    }
     let verify = run_command_output(python_exe.clone(), &["--version"], 30)?;
-    run_command_output(python_exe.clone(), &["-m", "pip", "--version"], 30)?;
     let pip_exe = python_home.join("Scripts").join("pip.exe");
     if !pip_exe.is_file() {
         return Err(format!(
@@ -4230,6 +4594,246 @@ fn python_repair_store() -> &'static Mutex<HashMap<String, PendingPythonRepair>>
     PYTHON_REPAIR_PREVIEWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn validation_check(
+    id: &str,
+    title: &str,
+    required: bool,
+    stage: &str,
+    result: Result<String, String>,
+) -> ValidationCheck {
+    match result {
+        Ok(detail) => ValidationCheck {
+            id: id.to_string(),
+            title: title.to_string(),
+            success: true,
+            required,
+            detail: first_meaningful_output_line(&detail).unwrap_or(detail),
+            stage: stage.to_string(),
+        },
+        Err(error) => ValidationCheck {
+            id: id.to_string(),
+            title: title.to_string(),
+            success: false,
+            required,
+            detail: error.trim().to_string(),
+            stage: stage.to_string(),
+        },
+    }
+}
+
+fn python_integrity_for_path(python_exe: &Path, paths: &AppPaths) -> PythonIntegrityReport {
+    let python_home = python_exe.parent().unwrap_or(python_exe);
+    let managed = is_path_inside(python_exe, &paths.pythons())
+        || is_path_inside(python_exe, &paths.current().join("python"));
+    let checks = vec![
+        validation_check(
+            "python-version",
+            "python --version",
+            true,
+            "PostInstallVerify",
+            run_command_output(python_exe.to_path_buf(), &["--version"], 30),
+        ),
+        validation_check(
+            "python-executable",
+            "sys.executable",
+            true,
+            "PostInstallVerify",
+            run_command_output(
+                python_exe.to_path_buf(),
+                &["-c", "import sys; print(sys.executable)"],
+                30,
+            ),
+        ),
+        validation_check(
+            "pip-module",
+            "python -m pip --version",
+            true,
+            "ComponentMissing",
+            run_command_output(python_exe.to_path_buf(), &["-m", "pip", "--version"], 60),
+        ),
+        validation_check(
+            "venv",
+            "python -m venv --help",
+            true,
+            "ComponentMissing",
+            run_command_output(python_exe.to_path_buf(), &["-m", "venv", "--help"], 60),
+        ),
+        validation_check(
+            "ssl",
+            "ssl",
+            true,
+            "ComponentMissing",
+            run_command_output(
+                python_exe.to_path_buf(),
+                &["-c", "import ssl; print(ssl.OPENSSL_VERSION)"],
+                30,
+            ),
+        ),
+        validation_check(
+            "sqlite3",
+            "sqlite3",
+            true,
+            "ComponentMissing",
+            run_command_output(
+                python_exe.to_path_buf(),
+                &["-c", "import sqlite3; print(sqlite3.sqlite_version)"],
+                30,
+            ),
+        ),
+        validation_check(
+            "ctypes",
+            "ctypes",
+            true,
+            "ComponentMissing",
+            run_command_output(
+                python_exe.to_path_buf(),
+                &["-c", "import ctypes; print('ok')"],
+                30,
+            ),
+        ),
+        validation_check(
+            "tkinter",
+            "tkinter",
+            false,
+            "OptionalComponentMissing",
+            run_command_output(
+                python_exe.to_path_buf(),
+                &["-c", "import tkinter; print('ok')"],
+                30,
+            ),
+        ),
+    ];
+    let pip_exe = python_home.join("Scripts").join("pip.exe");
+    let pip_exe_check = ValidationCheck {
+        id: "pip-exe".to_string(),
+        title: "Scripts\\pip.exe".to_string(),
+        success: pip_exe.is_file(),
+        required: true,
+        detail: if pip_exe.is_file() {
+            display_path(&pip_exe)
+        } else {
+            "Scripts\\pip.exe 不存在".to_string()
+        },
+        stage: "ExecutableMissing".to_string(),
+    };
+    let mut checks = checks;
+    checks.push(pip_exe_check);
+    let pip_module = checks
+        .iter()
+        .find(|item| item.id == "pip-module")
+        .map(|item| item.detail.clone())
+        .unwrap_or_default();
+    let pip_exe_output = if pip_exe.is_file() {
+        run_command_output(pip_exe.clone(), &["--version"], 30).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut risks = Vec::new();
+    if !pip_exe_output.is_empty()
+        && !pip_module.is_empty()
+        && !same_python_package_location(&pip_module, &pip_exe_output)
+    {
+        risks.push("pip.exe 与 python -m pip 归属不一致，建议使用 python -m pip。".to_string());
+    }
+    if checks
+        .iter()
+        .any(|item| item.id == "tkinter" && !item.success)
+    {
+        risks.push("tkinter 不可用，Python GUI 相关库可能无法使用。".to_string());
+    }
+    if display_path(python_exe)
+        .to_ascii_lowercase()
+        .contains("\\windowsapps\\")
+    {
+        risks
+            .push("当前 Python 可能是 Microsoft Store Alias；本程序不会自动关闭别名。".to_string());
+    }
+    let required_ok = checks
+        .iter()
+        .filter(|item| item.required)
+        .all(|item| item.success);
+    let mut suggestions =
+        vec!["优先使用 python -m pip，避免 pip.exe 指向其他 Python。".to_string()];
+    if managed
+        && checks
+            .iter()
+            .any(|item| item.id == "pip-module" && !item.success)
+    {
+        suggestions
+            .push("这是受管 Python，可生成 pip 修复计划执行 ensurepip 与 pip 升级。".to_string());
+    } else if !managed
+        && checks
+            .iter()
+            .any(|item| item.id == "pip-module" && !item.success)
+    {
+        suggestions.push(
+            "非受管 Python 只提示问题，不自动修复；请使用其官方安装器或包管理器处理。".to_string(),
+        );
+    }
+    PythonIntegrityReport {
+        python_path: display_path(python_exe),
+        python_home: display_path(python_home),
+        managed,
+        fully_usable: required_ok,
+        status: if required_ok {
+            if checks.iter().any(|item| !item.success && !item.required) {
+                "可用，存在可选组件提示".to_string()
+            } else {
+                "可用".to_string()
+            }
+        } else {
+            "组件缺失".to_string()
+        },
+        checks,
+        risks,
+        suggestions,
+    }
+}
+
+#[tauri::command]
+fn inspect_python_integrity(python_path: Option<String>) -> Result<PythonIntegrityReport, String> {
+    let paths = load_paths()?;
+    let python = python_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| resolve_tool(&paths, "python"))
+        .ok_or_else(|| "没有找到 Python，请先安装或切换 Python".to_string())?;
+    if !python.is_file() {
+        return Err("Python 路径不存在或不是文件".to_string());
+    }
+    Ok(python_integrity_for_path(&python, &paths))
+}
+
+#[tauri::command]
+fn create_managed_python_pip_repair_plan(python_path: String) -> Result<PythonRepairPlan, String> {
+    let paths = load_paths()?;
+    let python = PathBuf::from(python_path.trim());
+    if !python.is_file() {
+        return Err("Python 路径不存在或不是文件".to_string());
+    }
+    if !is_path_inside(&python, &paths.pythons())
+        && !is_path_inside(&python, &paths.current().join("python"))
+    {
+        return Err("只允许为 DevEnv Manager 受管 Python 生成 pip 修复计划".to_string());
+    }
+    let current_python = resolve_tool(&paths, "python")
+        .ok_or_else(|| "没有找到当前生效的 Python，请先切换到该受管 Python".to_string())?;
+    if path_key(&display_path(&current_python)) != path_key(&display_path(&python)) {
+        return Err(
+            "pip 修复计划只会操作当前生效的 Python；请先切换到该受管 Python 后再生成计划"
+                .to_string(),
+        );
+    }
+    preview_python_repair(true, true)
+}
+
+#[tauri::command]
+async fn apply_managed_python_pip_repair(plan_id: String) -> Result<OperationResult, String> {
+    apply_python_repair(plan_id).await
+}
+
 fn prepend_path_entries(existing: &str, additions: &[String]) -> (String, Vec<String>) {
     let existing_entries = split_path_entries(existing);
     let existing_keys = existing_entries
@@ -5527,12 +6131,51 @@ fn analyze_project(path: String) -> Result<ProjectAnalysis, String> {
     analyze_project_blocking(&PathBuf::from(path.trim()))
 }
 
-fn analyze_project_blocking(root: &Path) -> Result<ProjectAnalysis, String> {
+#[tauri::command]
+fn validate_directory_path(path: String) -> Result<DirectoryValidationResult, String> {
+    let root = PathBuf::from(path.trim());
     if !root.exists() {
-        return Err("项目目录不存在".to_string());
+        return Ok(DirectoryValidationResult {
+            path: display_path(root),
+            exists: false,
+            is_directory: false,
+            recognized_project: false,
+            signals: Vec::new(),
+            message: "该路径不存在，请重新选择项目文件夹。".to_string(),
+        });
     }
     if !root.is_dir() {
-        return Err("请选择目录而不是文件".to_string());
+        return Ok(DirectoryValidationResult {
+            path: display_path(root),
+            exists: true,
+            is_directory: false,
+            recognized_project: false,
+            signals: Vec::new(),
+            message: "请选择项目根目录，而不是单个文件。".to_string(),
+        });
+    }
+    let signals = project_signals(&root);
+    let recognized = !signals.is_empty();
+    Ok(DirectoryValidationResult {
+        path: display_path(root),
+        exists: true,
+        is_directory: true,
+        recognized_project: recognized,
+        message: if recognized {
+            "已识别常见项目文件，可继续分析。".to_string()
+        } else {
+            "没有识别到常见项目文件。你仍可以查看目录，但项目启动建议可能为空。".to_string()
+        },
+        signals,
+    })
+}
+
+fn analyze_project_blocking(root: &Path) -> Result<ProjectAnalysis, String> {
+    if !root.exists() {
+        return Err("该路径不存在，请重新选择项目文件夹。".to_string());
+    }
+    if !root.is_dir() {
+        return Err("请选择项目根目录，而不是单个文件。".to_string());
     }
     let signals = project_signals(root);
     let mut project_types = Vec::new();
@@ -5726,6 +6369,22 @@ fn analyze_project_blocking(root: &Path) -> Result<ProjectAnalysis, String> {
             true,
         ));
     }
+    let idea = inspect_idea_project_blocking(root);
+    if let Ok(report) = &idea {
+        if report.detected {
+            push_unique(&mut project_types, "IntelliJ IDEA");
+            recommendations.push(ProjectRuntimeRecommendation {
+                name: "IDEA 项目 JDK".to_string(),
+                requirement: if report.project_sdk.is_empty() {
+                    "未显式读取到 Project SDK".to_string()
+                } else {
+                    format!("IDEA Project SDK：{}", report.project_sdk)
+                },
+                status: report.jdk_match.clone(),
+            });
+            warnings.extend(report.warnings.iter().cloned());
+        }
+    }
     if has("bin/startup.cmd") && has("conf/application.properties") {
         push_unique(&mut project_types, "Nacos");
         let java = inspect_java_environment_blocking().ok();
@@ -5785,6 +6444,273 @@ fn analyze_project_blocking(root: &Path) -> Result<ProjectAnalysis, String> {
         recommended_runtime: recommendations,
         actions,
         warnings,
+    })
+}
+
+fn read_text_file_limited(path: &Path, max_bytes: u64) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() > max_bytes {
+        return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+fn extract_attr(text: &str, attr: &str) -> String {
+    let pattern = format!("{attr}=\"");
+    text.find(&pattern)
+        .and_then(|start| {
+            let rest = &text[start + pattern.len()..];
+            rest.find('"').map(|end| rest[..end].to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn extract_idea_sdk(text: &str) -> String {
+    for attr in [
+        "project-jdk-name",
+        "jdkName",
+        "inheritedJdk",
+        "LANGUAGE_LEVEL",
+    ] {
+        let value = extract_attr(text, attr);
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    String::new()
+}
+
+#[tauri::command]
+fn inspect_idea_project(path: String) -> Result<IdeaProjectReport, String> {
+    inspect_idea_project_blocking(&PathBuf::from(path.trim()))
+}
+
+fn inspect_idea_project_blocking(root: &Path) -> Result<IdeaProjectReport, String> {
+    if !root.exists() {
+        return Err("该路径不存在，请重新选择项目文件夹。".to_string());
+    }
+    if !root.is_dir() {
+        return Err("请选择项目根目录，而不是单个文件。".to_string());
+    }
+    let idea_dir = root.join(".idea");
+    let mut read_files = Vec::new();
+    let mut project_sdk = String::new();
+    let mut language_level = String::new();
+    let mut compiler_target = String::new();
+    let mut maven_importer_jdk = String::new();
+    let mut gradle_jvm = String::new();
+    let mut output_dir = String::new();
+    let mut module_sdks = Vec::new();
+    let mut module_count = 0_usize;
+    let mut warnings = Vec::new();
+
+    if let Some(misc) = read_text_file_limited(&idea_dir.join("misc.xml"), 256 * 1024) {
+        read_files.push(".idea/misc.xml".to_string());
+        project_sdk = extract_attr(&misc, "project-jdk-name");
+        language_level = extract_attr(&misc, "languageLevel");
+        let maven = extract_attr(&misc, "jdkNameForImporter");
+        if !maven.is_empty() {
+            maven_importer_jdk = maven;
+        }
+        let gradle = extract_attr(&misc, "gradleJvm");
+        if !gradle.is_empty() {
+            gradle_jvm = gradle;
+        }
+    }
+    if let Some(compiler) = read_text_file_limited(&idea_dir.join("compiler.xml"), 256 * 1024) {
+        read_files.push(".idea/compiler.xml".to_string());
+        compiler_target = extract_attr(&compiler, "target");
+        output_dir = extract_attr(&compiler, "url");
+    }
+    if let Some(modules) = read_text_file_limited(&idea_dir.join("modules.xml"), 256 * 1024) {
+        read_files.push(".idea/modules.xml".to_string());
+        module_count = modules
+            .matches("fileurl=")
+            .count()
+            .max(modules.matches(".iml").count());
+    }
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("iml"))
+            {
+                if let Some(text) = read_text_file_limited(&path, 256 * 1024) {
+                    read_files.push(
+                        path.file_name()
+                            .and_then(OsStr::to_str)
+                            .unwrap_or("*.iml")
+                            .to_string(),
+                    );
+                    let sdk = extract_idea_sdk(&text);
+                    if !sdk.is_empty() {
+                        module_sdks.push(sdk);
+                    }
+                }
+            }
+        }
+    }
+    if idea_dir.join("workspace.xml").is_file() {
+        warnings.push(
+            "检测到 workspace.xml；为保护隐私，本版本不全量读取最近文件、历史路径或敏感配置。"
+                .to_string(),
+        );
+    }
+    module_sdks.sort();
+    module_sdks.dedup();
+    let java = inspect_java_environment_blocking().ok();
+    let current_java_home = java
+        .as_ref()
+        .map(|report| report.java_home_expanded.clone())
+        .unwrap_or_default();
+    let current_java_version = java
+        .as_ref()
+        .map(|report| report.java_version.clone())
+        .unwrap_or_default();
+    let jdk_match = if project_sdk.is_empty() {
+        "未读取到 IDEA Project SDK，仅做只读提示。".to_string()
+    } else if current_java_version.contains(&project_sdk)
+        || current_java_home.contains(&project_sdk)
+    {
+        "IDEA 项目 JDK 与当前 JAVA_HOME 大致匹配。".to_string()
+    } else {
+        format!(
+            "IDEA 项目要求 {}；当前 JAVA_HOME 为 {}。建议切换 JDK 或检查 IDEA Project SDK。",
+            project_sdk,
+            if current_java_home.is_empty() {
+                "未设置".to_string()
+            } else {
+                current_java_home.clone()
+            }
+        )
+    };
+    Ok(IdeaProjectReport {
+        root: display_path(root),
+        detected: idea_dir.is_dir() || !read_files.is_empty(),
+        read_files,
+        project_sdk,
+        language_level,
+        module_sdks,
+        module_count,
+        compiler_target,
+        maven_importer_jdk,
+        gradle_jvm,
+        output_dir,
+        current_java_home,
+        current_java_version,
+        jdk_match,
+        warnings,
+    })
+}
+
+#[tauri::command]
+fn verify_java_consumer_environment(
+    consumer: String,
+    root: String,
+) -> Result<JavaConsumerReport, String> {
+    verify_java_consumer_environment_blocking(&consumer, &PathBuf::from(root.trim()))
+}
+
+#[tauri::command]
+fn verify_nexus_java_environment(root: String) -> Result<JavaConsumerReport, String> {
+    verify_java_consumer_environment_blocking("Nexus", &PathBuf::from(root.trim()))
+}
+
+fn verify_java_consumer_environment_blocking(
+    consumer: &str,
+    root: &Path,
+) -> Result<JavaConsumerReport, String> {
+    if !root.exists() {
+        return Err("该路径不存在，请重新选择项目文件夹。".to_string());
+    }
+    if !root.is_dir() {
+        return Err("请选择项目根目录，而不是单个文件。".to_string());
+    }
+    let paths = load_paths()?;
+    let user = user_environment().unwrap_or_default();
+    let process = env::vars().collect::<HashMap<_, _>>();
+    let raw = user.get("JAVA_HOME").cloned();
+    let expanded = raw
+        .as_deref()
+        .map(|value| expand_environment_path(value, &paths));
+    let java = expanded
+        .as_deref()
+        .map(|home| PathBuf::from(home).join("bin/java.exe"));
+    let javac = expanded
+        .as_deref()
+        .map(|home| PathBuf::from(home).join("bin/javac.exe"));
+    let path_value = user
+        .get("Path")
+        .or_else(|| user.get("PATH"))
+        .cloned()
+        .unwrap_or_default();
+    let path_java = find_in_configured_path("java", &path_value, &paths).map(display_path);
+    let consumer_lower = consumer.to_ascii_lowercase();
+    let startup_exists = if consumer_lower.contains("nacos") {
+        root.join("bin").join("startup.cmd").is_file()
+    } else if consumer_lower.contains("nexus") {
+        root.join("bin").join("nexus.exe").is_file()
+            || root.join("bin").join("nexus.bat").is_file()
+            || root.join("bin").join("nexus").is_file()
+    } else if consumer_lower.contains("maven") {
+        root.join("pom.xml").is_file()
+    } else if consumer_lower.contains("gradle") {
+        root.join("build.gradle").is_file()
+            || root.join("build.gradle.kts").is_file()
+            || root.join("gradlew").is_file()
+    } else {
+        root.join("bin").join("startup.cmd").is_file()
+            || fs::read_dir(root)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(|ext| {
+                            ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd")
+                        })
+                })
+    };
+    let indirect = raw.as_deref().is_some_and(|value| value.contains('%'));
+    let process_differs = process.get("JAVA_HOME") != user.get("JAVA_HOME")
+        || process.get("Path").or_else(|| process.get("PATH"))
+            != user.get("Path").or_else(|| user.get("PATH"));
+    let java_exists = java.as_deref().is_some_and(Path::is_file);
+    let javac_exists = javac.as_deref().is_some_and(Path::is_file);
+    let usable = startup_exists && java_exists && javac_exists && !indirect;
+    let mut explanation = vec![
+        format!("{consumer} 读取不到 Java 不一定是 JDK 没装。"),
+        "常见原因包括 JAVA_HOME 间接引用、进程环境未刷新、服务仍使用旧环境、PATH 首个 java.exe 与 JAVA_HOME 不一致，或 JDK 缺少 javac.exe。".to_string(),
+    ];
+    if indirect {
+        explanation.push("当前 JAVA_HOME 是间接引用，建议写入真实绝对路径。".to_string());
+    }
+    if process_differs {
+        explanation
+            .push("当前进程环境与最新用户环境不同，请重启终端、IDE 或相关服务。".to_string());
+    }
+    if !javac_exists {
+        explanation.push("JAVA_HOME 缺少 javac.exe，可能不是完整 JDK。".to_string());
+    }
+    Ok(JavaConsumerReport {
+        consumer: consumer.to_string(),
+        root: display_path(root),
+        startup_exists,
+        java_home_raw: raw,
+        java_home_expanded: expanded,
+        java_exists,
+        javac_exists,
+        path_java,
+        indirect_java_home_risk: indirect,
+        process_user_env_differs: process_differs,
+        usable,
+        explanation,
     })
 }
 
@@ -6690,6 +7616,7 @@ fn generate_vscode_config(project_path: String) -> Result<OperationResult, Strin
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             app_snapshot,
             storage_cleanup_architecture,
@@ -6718,7 +7645,15 @@ pub fn run() {
             apply_java_stabilize_plan,
             verify_java_toolchain,
             verify_nacos_java_environment,
+            verify_nexus_java_environment,
+            verify_java_consumer_environment,
             verify_maven_gradle_with_current_jdk,
+            inspect_python_integrity,
+            create_managed_python_pip_repair_plan,
+            apply_managed_python_pip_repair,
+            inspect_runtime_strong_verification,
+            validate_directory_path,
+            inspect_idea_project,
             repair_maven_gradle_registration,
             list_env_backups,
             inspect_env_backup,
@@ -6993,8 +7928,13 @@ fn run_cli(args: Vec<String>) -> Result<String, String> {
         "python" if args.get(1).map(String::as_str) == Some("verify") => {
             let paths = load_paths()?;
             let snapshot = env_core::inspect_env_reliability(&paths.root);
-            serde_json::to_string_pretty(&snapshot.python)
-                .map_err(|err| format!("生成 Python 验证失败：{err}"))
+            let integrity = resolve_tool(&paths, "python")
+                .map(|python| python_integrity_for_path(&python, &paths));
+            serde_json::to_string_pretty(&json!({
+                "environment": snapshot.python,
+                "integrity": integrity,
+            }))
+            .map_err(|err| format!("生成 Python 验证失败：{err}"))
         }
         "nacos" if args.get(1).map(String::as_str) == Some("verify") => {
             let root = args
@@ -7571,6 +8511,16 @@ fn find_in_configured_path(
 
 fn java_root_from_executable(executable: &Path) -> Option<PathBuf> {
     executable.parent()?.parent().map(Path::to_path_buf)
+}
+
+fn normalized_absolute(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn is_path_inside(path: &Path, root: &Path) -> bool {
+    let candidate_key = path_key(&display_path(normalized_absolute(path)));
+    let root_key = path_key(&display_path(normalized_absolute(root)));
+    candidate_key == root_key || candidate_key.starts_with(&format!("{root_key}\\"))
 }
 
 fn first_output_line(executable: &Path, args: &[&str]) -> String {
@@ -10616,6 +11566,77 @@ mod tests {
         let signals = project_signals(root.path());
         assert!(signals.contains(&"bin/startup.cmd".to_string()));
         assert!(signals.contains(&"conf/application.properties".to_string()));
+    }
+
+    #[test]
+    fn directory_validation_reports_file_and_unknown_project() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("single.txt");
+        fs::write(&file, "x").unwrap();
+        let file_result = validate_directory_path(display_path(&file)).unwrap();
+        assert!(file_result.exists);
+        assert!(!file_result.is_directory);
+        assert!(file_result.message.contains("项目根目录"));
+
+        let dir_result = validate_directory_path(display_path(root.path())).unwrap();
+        assert!(dir_result.is_directory);
+        assert!(!dir_result.recognized_project);
+        assert!(dir_result.message.contains("没有识别到常见项目文件"));
+    }
+
+    #[test]
+    fn idea_project_analysis_reads_safe_files_only() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".idea")).unwrap();
+        fs::write(
+            root.path().join(".idea").join("misc.xml"),
+            r#"<project><component name="ProjectRootManager" languageLevel="JDK_17" project-jdk-name="17" /></project>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".idea").join("compiler.xml"),
+            r#"<project><bytecodeTargetLevel target="17" /></project>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("demo.iml"),
+            r#"<module><orderEntry type="jdk" jdkName="17" /></module>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".idea").join("workspace.xml"),
+            "recentFiles=\"secret\" token=\"hidden\"",
+        )
+        .unwrap();
+        let report = inspect_idea_project_blocking(root.path()).unwrap();
+        assert!(report.detected);
+        assert_eq!(report.project_sdk, "17");
+        assert!(report
+            .read_files
+            .iter()
+            .any(|item| item == ".idea/misc.xml"));
+        assert!(!report
+            .read_files
+            .iter()
+            .any(|item| item.contains("workspace.xml")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|item| item.contains("workspace.xml")));
+    }
+
+    #[test]
+    fn java_consumer_report_explains_missing_javac() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("bin")).unwrap();
+        fs::write(root.path().join("bin").join("nexus.bat"), "@echo off").unwrap();
+        let report = verify_java_consumer_environment_blocking("Nexus", root.path()).unwrap();
+        assert_eq!(report.consumer, "Nexus");
+        assert!(report.startup_exists);
+        assert!(report
+            .explanation
+            .iter()
+            .any(|item| item.contains("读取不到 Java")));
     }
 
     #[test]

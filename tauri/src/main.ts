@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
   Boxes,
@@ -156,6 +157,76 @@ type FeatureRiskInfo = {
   requiresAdmin: boolean;
   confirmationLevel: string;
   safeAlternatives: string[];
+};
+
+type ValidationCheck = {
+  id: string;
+  title: string;
+  success: boolean;
+  required: boolean;
+  detail: string;
+  stage: string;
+};
+
+type PythonIntegrityReport = {
+  pythonPath: string;
+  pythonHome: string;
+  managed: boolean;
+  fullyUsable: boolean;
+  status: string;
+  checks: ValidationCheck[];
+  risks: string[];
+  suggestions: string[];
+};
+
+type RuntimeStrongVerificationReport = {
+  generatedAt: string;
+  items: Array<{
+    kind: string;
+    version: string;
+    path: string;
+    registered: boolean;
+    current: boolean;
+    environmentEffective: boolean;
+    status: string;
+    checks: ValidationCheck[];
+    failureStage?: string;
+    report: string[];
+  }>;
+  summary: string[];
+};
+
+type IdeaProjectReport = {
+  root: string;
+  detected: boolean;
+  readFiles: string[];
+  projectSdk: string;
+  languageLevel: string;
+  moduleSdks: string[];
+  moduleCount: number;
+  compilerTarget: string;
+  mavenImporterJdk: string;
+  gradleJvm: string;
+  outputDir: string;
+  currentJavaHome: string;
+  currentJavaVersion: string;
+  jdkMatch: string;
+  warnings: string[];
+};
+
+type JavaConsumerReport = {
+  consumer: string;
+  root: string;
+  startupExists: boolean;
+  javaHomeRaw?: string;
+  javaHomeExpanded?: string;
+  javaExists: boolean;
+  javacExists: boolean;
+  pathJava?: string;
+  indirectJavaHomeRisk: boolean;
+  processUserEnvDiffers: boolean;
+  usable: boolean;
+  explanation: string[];
 };
 
 type KillResult = OperationResult & {
@@ -1042,9 +1113,13 @@ app.innerHTML = `
         <section class="panel runtime-manager">
           <div class="panel-head">
             <div class="panel-title">${icon(Activity)}<h2>Python 环境分析</h2></div>
-            <button id="analyze-python">${icon(Search)}<span>分析</span></button>
+            <div class="toolbar compact">
+              <button id="analyze-python">${icon(Search)}<span>分析</span></button>
+              <button id="inspect-python-integrity">${icon(Shield)}<span>完整性检查</span></button>
+            </div>
           </div>
           <div id="python-analysis" class="python-analysis"></div>
+          <div id="python-integrity-result" class="runtime-list"><div class="empty">点击“完整性检查”验证 pip、venv、ssl、sqlite3、ctypes 和 tkinter。</div></div>
           <div class="repair-options">
             <label><input id="python-repair-pip" type="checkbox" checked /> 修复并验证当前 Python 的 pip</label>
             <label><input id="python-repair-path" type="checkbox" checked /> 将当前 Python/Scripts 置于用户 PATH 前部</label>
@@ -1053,12 +1128,16 @@ app.innerHTML = `
           <div id="python-repair-preview"><div class="empty">先分析，再预览；不会卸载其他 Python 或自动关闭 Store 别名</div></div>
         </section>
         <section class="panel runtime-manager">
-          <div class="panel-title">${icon(Download)}<h2>构建工具</h2></div>
+          <div class="panel-head">
+            <div class="panel-title">${icon(Download)}<h2>构建工具</h2></div>
+            <button id="inspect-runtime-strong">${icon(Shield)}<span>强验证所有运行时</span></button>
+          </div>
           <div class="toolbar">
             <button id="install-maven">${icon(Download)}<span>安装 Maven 最新版</span></button>
             <button id="install-gradle">${icon(Download)}<span>安装 Gradle 最新版</span></button>
           </div>
           <div id="managed-build-tools" class="runtime-list"></div>
+          <div id="runtime-strong-result" class="runtime-list"><div class="empty">检查 JDK/Python/Node/Maven/Gradle/Go 的登记、组件、current 指针和环境生效状态。</div></div>
         </section>
       </section>
 
@@ -1077,6 +1156,7 @@ app.innerHTML = `
             <div id="env-reliability-result"><div class="empty">点击“检查可靠性”查看 JAVA_HOME raw/expanded、PATH 命中顺序、Python/pip、Maven/Gradle 和 Nacos 风险。</div></div>
             <div class="form-row">
               <input id="java-stabilize-path" placeholder="JDK 根目录，例如 D:\\DevEnvManager\\current\\jdk" />
+              <button data-pick-directory="java-stabilize-path">${icon(FolderSearch)}<span>选择 JDK</span></button>
               <button id="create-java-stabilize-plan">生成 Java 稳定修复计划</button>
               <button id="apply-env-repair-plan" class="danger-button" disabled>确认写入用户级 JAVA_HOME/PATH</button>
             </div>
@@ -1388,13 +1468,13 @@ app.innerHTML = `
         </section>
         <section class="maintenance-panel" data-maintenance-panel="large-files">
           <div class="panel-head"><div class="panel-title">${icon(Search)}<h2>大文件 Top 100</h2></div><button id="scan-large-files">开始只读扫描</button></div>
-          <div class="form-row"><input id="large-file-root" placeholder="扫描目录；留空使用用户目录" /><input id="large-file-min" type="number" min="1" value="100" title="最小 MB" /><span>MB 以上</span></div>
+          <div class="form-row"><input id="large-file-root" placeholder="扫描目录；留空使用用户目录" /><button data-pick-directory="large-file-root">${icon(FolderSearch)}<span>选择文件夹</span></button><input id="large-file-min" type="number" min="1" value="100" title="最小 MB" /><span>MB 以上</span></div>
           <div id="large-file-result" class="runtime-list"><div class="empty">选择或填写扫描范围后开始</div></div>
         </section>
         <section class="maintenance-panel" data-maintenance-panel="duplicates">
           <div class="panel-head"><div class="panel-title">${icon(Boxes)}<h2>重复文件</h2></div><button id="scan-duplicates">按大小与 SHA256 扫描</button></div>
           <div class="scan-only-banner">${icon(Shield)}<span>只扫描用户明确选择的目录；先按大小分组，再读取候选内容计算 SHA256。不提供删除。</span></div>
-          <div class="form-row"><input id="duplicate-root" placeholder="扫描目录；留空使用用户目录" /><input id="duplicate-min" type="number" min="1" value="10" title="最小 MB" /><span>MB 以上</span></div>
+          <div class="form-row"><input id="duplicate-root" placeholder="扫描目录；留空使用用户目录" /><button data-pick-directory="duplicate-root">${icon(FolderSearch)}<span>选择文件夹</span></button><input id="duplicate-min" type="number" min="1" value="10" title="最小 MB" /><span>MB 以上</span></div>
           <div id="duplicate-result"><div class="empty">尚未扫描重复文件</div></div>
         </section>
         <section class="maintenance-panel" data-maintenance-panel="apps">
@@ -1408,6 +1488,8 @@ app.innerHTML = `
           <div class="form-row">
             <input id="move-source" placeholder="源目录，例如 C:\\Users\\你\\Downloads 或缓存目录" />
             <input id="move-target-drive" value="D:" placeholder="目标盘或目标目录，例如 D:" />
+            <button data-pick-directory="move-source">${icon(FolderSearch)}<span>源目录</span></button>
+            <button data-pick-directory="move-target-drive">${icon(FolderSearch)}<span>目标目录</span></button>
             <select id="move-mode">
               <option value="archive_only">归档整理</option>
               <option value="move_cache_folder">缓存搬家</option>
@@ -1508,6 +1590,7 @@ app.innerHTML = `
           <div class="form-row command-row">
             <input id="command-input" value="node --version" />
             <input id="command-cwd" placeholder="工作目录，可留空" />
+            <button data-pick-directory="command-cwd">${icon(FolderSearch)}<span>选择文件夹</span></button>
             <button id="run-command">${icon(Play)}<span>运行</span></button>
           </div>
           <pre id="command-output" class="command-output"></pre>
@@ -1547,12 +1630,18 @@ app.innerHTML = `
           <div class="panel-title">${icon(FolderSearch)}<h2>项目启动向导</h2></div>
           <div class="form-row">
             <input id="project-path" value="E:\\\\pycode\\\\dailytools" />
+            <button data-pick-directory="project-path" data-auto-analyze="true">${icon(FolderSearch)}<span>选择文件夹</span></button>
             <button id="check-project">${icon(Play)}<span>分析</span></button>
           </div>
           <div class="toolbar project-actions">
             <button id="preview-project-config">${icon(Hammer)}<span>生成 VS Code / IDEA 配置预览</span></button>
+            <button id="inspect-idea-project">${icon(Search)}<span>只读读取 IDEA 配置</span></button>
+            <button id="verify-nacos-java">${icon(Shield)}<span>验证 Nacos Java</span></button>
+            <button id="verify-nexus-java">${icon(Shield)}<span>验证 Nexus Java</span></button>
           </div>
           <section id="project-config-preview" class="project-config-preview"><div class="empty">先分析项目，再生成可编辑的配置预览</div></section>
+          <section id="idea-project-result" class="runtime-list"><div class="empty">选择项目文件夹后，可只读分析 .idea/misc.xml、compiler.xml 和 *.iml。</div></section>
+          <section id="java-consumer-result" class="runtime-list"><div class="empty">Nacos/Nexus/Maven/Gradle/Spring Boot 等 Java 消费者验证会读取最新用户环境，不修改项目。</div></section>
           <div id="project-health" class="project-health"></div>
           <pre id="project-output" class="command-output"></pre>
         </section>
@@ -1589,8 +1678,12 @@ const state = {
   profileImportPreview: null as ConfigProfileImportPreview | null,
   doctor: null as DoctorReport | null,
   python: null as PythonAnalysis | null,
+  pythonIntegrity: null as PythonIntegrityReport | null,
   pythonRepairPlan: null as PythonRepairPlan | null,
+  runtimeStrong: null as RuntimeStrongVerificationReport | null,
   project: null as ProjectAnalysis | null,
+  ideaProject: null as IdeaProjectReport | null,
+  javaConsumer: null as JavaConsumerReport | null,
   projectConfigPreview: null as ProjectConfigPreview | null,
   toolchains: null as ToolchainReport | null,
   platforms: null as PlatformReport | null,
@@ -2366,6 +2459,47 @@ function renderPythonRepairPlan() {
     <button id="apply-python-repair" class="primary">二次确认并执行</button></article>`;
 }
 
+function renderValidationChecks(checks: ValidationCheck[]) {
+  return checks.map((check) => `
+    <article class="runtime ${check.success ? "" : check.required ? "warn" : "notice"}">
+      <div><strong>${escapeHtml(check.title)}</strong><span>${check.success ? "通过" : check.required ? "必需项失败" : "可选项提示"}</span></div>
+      <small>${escapeHtml(check.stage)} · ${escapeHtml(check.detail || "无输出")}</small>
+    </article>
+  `).join("");
+}
+
+function renderPythonIntegrity() {
+  const element = document.querySelector<HTMLElement>("#python-integrity-result");
+  if (!element) return;
+  const report = state.pythonIntegrity;
+  element.innerHTML = report
+    ? `<article class="runtime">
+        <div><strong>${escapeHtml(report.status)}</strong>${riskBadge(report.fullyUsable ? "info" : "high")}</div>
+        <small>${escapeHtml(report.pythonPath)} · ${report.managed ? "受管 Python" : "非受管 Python"}</small>
+      </article>
+      ${renderValidationChecks(report.checks)}
+      ${report.risks.length ? `<ul>${report.risks.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}
+      ${report.suggestions.length ? `<ul>${report.suggestions.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}
+      <button id="create-managed-python-pip-plan" ${report.managed ? "" : "disabled"}>生成受管 Python pip 修复计划</button>`
+    : `<div class="empty">点击“完整性检查”验证 pip、venv、ssl、sqlite3、ctypes 和 tkinter。</div>`;
+}
+
+function renderRuntimeStrongVerification() {
+  const element = document.querySelector<HTMLElement>("#runtime-strong-result");
+  if (!element) return;
+  const report = state.runtimeStrong;
+  element.innerHTML = report
+    ? `<div class="scan-only-banner">${icon(Shield)}<span>${report.summary.map(escapeHtml).join(" ")}</span></div>
+      ${paginate("runtime-strong", report.items, (item) => `
+        <article class="runtime">
+          <div><strong>${escapeHtml(item.kind)} ${escapeHtml(item.version)}</strong><span>${escapeHtml(item.status)}</span></div>
+          <small>${escapeHtml(item.path)} · current=${item.current ? "是" : "否"} · 环境生效=${item.environmentEffective ? "是" : "否"}${item.failureStage ? ` · 失败阶段=${escapeHtml(item.failureStage)}` : ""}</small>
+          <div class="runtime-list compact-list">${renderValidationChecks(item.checks)}</div>
+        </article>
+      `)}`
+    : `<div class="empty">检查 JDK/Python/Node/Maven/Gradle/Go 的登记、组件、current 指针和环境生效状态。</div>`;
+}
+
 function renderToolStates(items: ToolState[]) {
   return items
     .map(
@@ -2638,6 +2772,50 @@ function renderProjectAnalysis(analysis: ProjectAnalysis) {
   `;
 }
 
+function renderIdeaProject() {
+  const element = document.querySelector<HTMLElement>("#idea-project-result");
+  if (!element) return;
+  const report = state.ideaProject;
+  element.innerHTML = report
+    ? `<article class="runtime">
+        <div><strong>${report.detected ? "已读取 IDEA 配置" : "未发现 IDEA 配置"}</strong><span>${escapeHtml(report.jdkMatch)}</span></div>
+        <small>${escapeHtml(report.root)}</small>
+      </article>
+      <div class="kv-list">
+        <div><span>Project SDK</span><strong>${escapeHtml(report.projectSdk || "未显式配置")}</strong></div>
+        <div><span>Language Level</span><strong>${escapeHtml(report.languageLevel || "未读取")}</strong></div>
+        <div><span>Compiler target</span><strong>${escapeHtml(report.compilerTarget || "未读取")}</strong></div>
+        <div><span>Gradle JVM</span><strong>${escapeHtml(report.gradleJvm || "未显式配置")}</strong></div>
+        <div><span>Maven importer JDK</span><strong>${escapeHtml(report.mavenImporterJdk || "未显式配置")}</strong></div>
+        <div><span>模块数量</span><strong>${report.moduleCount}</strong></div>
+      </div>
+      <div class="chip-row">${report.readFiles.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
+      ${report.moduleSdks.length ? `<div class="chip-row">${report.moduleSdks.map((item) => `<span>Module SDK: ${escapeHtml(item)}</span>`).join("")}</div>` : ""}
+      ${report.warnings.length ? `<ul>${report.warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}`
+    : `<div class="empty">选择项目文件夹后，可只读分析 .idea/misc.xml、compiler.xml 和 *.iml。</div>`;
+}
+
+function renderJavaConsumer() {
+  const element = document.querySelector<HTMLElement>("#java-consumer-result");
+  if (!element) return;
+  const report = state.javaConsumer;
+  element.innerHTML = report
+    ? `<article class="runtime ${report.usable ? "" : "warn"}">
+        <div><strong>${escapeHtml(report.consumer)} Java 环境</strong><span>${report.usable ? "可读取" : "需要关注"}</span></div>
+        <small>${escapeHtml(report.root)}</small>
+      </article>
+      <div class="kv-list">
+        <div><span>启动入口/项目文件</span><strong>${report.startupExists ? "存在" : "未发现"}</strong></div>
+        <div><span>JAVA_HOME raw</span><strong>${escapeHtml(report.javaHomeRaw || "未设置")}</strong></div>
+        <div><span>JAVA_HOME expanded</span><strong>${escapeHtml(report.javaHomeExpanded || "未设置")}</strong></div>
+        <div><span>java.exe</span><strong>${report.javaExists ? "存在" : "缺失"}</strong></div>
+        <div><span>javac.exe</span><strong>${report.javacExists ? "存在" : "缺失"}</strong></div>
+        <div><span>PATH 首个 java</span><strong>${escapeHtml(report.pathJava || "未发现")}</strong></div>
+      </div>
+      <ul>${report.explanation.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
+    : `<div class="empty">Nacos/Nexus/Maven/Gradle/Spring Boot 等 Java 消费者验证会读取最新用户环境，不修改项目。</div>`;
+}
+
 function renderProjectPortConfigs() {
   const element = document.querySelector<HTMLElement>("#project-port-configs");
   if (!element) return;
@@ -2703,6 +2881,8 @@ async function refreshBase() {
   renderProfileImportPreview();
   renderDoctor();
   renderPythonAnalysis();
+  renderPythonIntegrity();
+  renderRuntimeStrongVerification();
   renderRuntimes();
   renderJdkDistributions();
   renderJavaEnvironment();
@@ -2713,6 +2893,8 @@ async function refreshBase() {
   renderCleanupPlan();
   renderCleanupResult();
   renderProjectConfigPreview();
+  renderIdeaProject();
+  renderJavaConsumer();
   renderFolderUsage("#desktop-usage", state.desktopUsage, "desktop-usage");
   renderFolderUsage("#downloads-usage", state.downloadsUsage, "downloads-usage");
   renderLargeFiles();
@@ -3494,6 +3676,31 @@ function activateView(view: string) {
   renderFeatureHelp(view);
 }
 
+async function pickDirectoryInto(inputId: string, autoAnalyze = false) {
+  try {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "选择文件夹",
+    });
+    if (!selected || Array.isArray(selected)) return;
+    const input = document.querySelector<HTMLInputElement>(`#${inputId}`);
+    if (!input) return;
+    input.value = selected;
+    if (inputId === "project-path") {
+      const validation = await invoke<{ message: string; recognizedProject: boolean }>("validate_directory_path", { path: selected });
+      showToast(validation.message, !validation.recognizedProject);
+      if (autoAnalyze) {
+        const analysis = await invoke<ProjectAnalysis>("analyze_project", { path: selected });
+        renderProjectAnalysis(analysis);
+        await inspectProjectPorts(false);
+      }
+    }
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
 const VIEW_FEATURE_MAP: Record<string, string> = {
   overview: "overview",
   doctor: "doctor",
@@ -3560,6 +3767,14 @@ document.querySelectorAll<HTMLButtonElement>("[data-maintenance-tab]").forEach((
     document.querySelectorAll("[data-maintenance-tab]").forEach((item) => item.classList.toggle("active", item === button));
     document.querySelectorAll<HTMLElement>("[data-maintenance-panel]").forEach((panel) => panel.classList.toggle("active", panel.dataset.maintenancePanel === tab));
     if (tab === "move") void loadArchivePlan();
+  });
+});
+
+document.querySelectorAll<HTMLButtonElement>("[data-pick-directory]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const target = button.dataset.pickDirectory || "";
+    if (!target) return;
+    void pickDirectoryInto(target, button.dataset.autoAnalyze === "true");
   });
 });
 
@@ -3679,6 +3894,26 @@ document.querySelector("#analyze-python")?.addEventListener("click", async () =>
     state.python = await invoke<PythonAnalysis>("analyze_python_environment");
     renderPythonAnalysis();
     showToast("Python 环境分析完成");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+document.querySelector("#inspect-python-integrity")?.addEventListener("click", async () => {
+  showToast("正在检查 Python 完整性");
+  try {
+    state.pythonIntegrity = await invoke<PythonIntegrityReport>("inspect_python_integrity", { pythonPath: null });
+    renderPythonIntegrity();
+    showToast(state.pythonIntegrity.fullyUsable ? "Python 核心组件可用" : "Python 存在核心组件缺失", !state.pythonIntegrity.fullyUsable);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+document.querySelector("#inspect-runtime-strong")?.addEventListener("click", async () => {
+  showToast("正在强验证已登记运行时");
+  try {
+    state.runtimeStrong = await invoke<RuntimeStrongVerificationReport>("inspect_runtime_strong_verification");
+    renderRuntimeStrongVerification();
+    showToast(`运行时强验证完成：${state.runtimeStrong.items.length} 项`);
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error), true);
   }
@@ -4295,6 +4530,42 @@ document.querySelector("#preview-project-config")?.addEventListener("click", asy
   }
 });
 
+document.querySelector("#inspect-idea-project")?.addEventListener("click", async () => {
+  const path = document.querySelector<HTMLInputElement>("#project-path")?.value.trim() || "";
+  showToast("正在只读读取 IDEA 配置");
+  try {
+    state.ideaProject = await invoke<IdeaProjectReport>("inspect_idea_project", { path });
+    renderIdeaProject();
+    showToast(state.ideaProject.detected ? "IDEA 配置分析完成" : "未发现 IDEA 配置");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+
+document.querySelector("#verify-nacos-java")?.addEventListener("click", async () => {
+  const root = document.querySelector<HTMLInputElement>("#project-path")?.value.trim() || "";
+  showToast("正在验证 Nacos Java 环境");
+  try {
+    state.javaConsumer = await invoke<JavaConsumerReport>("verify_java_consumer_environment", { consumer: "Nacos", root });
+    renderJavaConsumer();
+    showToast(state.javaConsumer.usable ? "Nacos 可读取当前 Java 环境" : "Nacos Java 环境需要关注", !state.javaConsumer.usable);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+
+document.querySelector("#verify-nexus-java")?.addEventListener("click", async () => {
+  const root = document.querySelector<HTMLInputElement>("#project-path")?.value.trim() || "";
+  showToast("正在验证 Nexus Java 环境");
+  try {
+    state.javaConsumer = await invoke<JavaConsumerReport>("verify_nexus_java_environment", { root });
+    renderJavaConsumer();
+    showToast(state.javaConsumer.usable ? "Nexus 可读取当前 Java 环境" : "Nexus Java 环境需要关注", !state.javaConsumer.usable);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), true);
+  }
+});
+
 document.querySelector("#inspect-project-ports")?.addEventListener("click", () => void inspectProjectPorts());
 document.querySelector("#port-monitor-enabled")?.addEventListener("change", (event) => {
   const enabled = (event.target as HTMLInputElement).checked;
@@ -4341,7 +4612,7 @@ document.querySelectorAll<HTMLButtonElement>(".sort-head").forEach((button) => {
 
 document.addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>(
-    "button[data-action], button[data-toolchain-action], button[data-python-tool], button[data-page-key], button[data-dev-cache], button[data-chsrc-action], button[data-cleanup-report-action], button[data-restore-env-backup], button[data-mysql-action], #apply-project-config, #apply-environment-preview, #apply-python-repair, #execute-mysql-plan, #accept-safety-disclaimer",
+    "button[data-action], button[data-toolchain-action], button[data-python-tool], button[data-page-key], button[data-dev-cache], button[data-chsrc-action], button[data-cleanup-report-action], button[data-restore-env-backup], button[data-mysql-action], #apply-project-config, #apply-environment-preview, #apply-python-repair, #create-managed-python-pip-plan, #execute-mysql-plan, #accept-safety-disclaimer",
   );
   if (!button) return;
   const mysqlAction = button.dataset.mysqlAction;
@@ -4399,6 +4670,7 @@ document.addEventListener("click", (event) => {
     if (pageKey === "ports") renderPorts();
     else if (pageKey === "port-history") renderPortHistory();
     else if (pageKey === "runtime-list" || pageKey.startsWith("managed-")) renderRuntimes();
+    else if (pageKey === "runtime-strong") renderRuntimeStrongVerification();
     else if (pageKey === "path-warnings") renderEnv();
     else if (pageKey === "env-health") renderHealth();
     else if (pageKey === "profiles") renderProfiles();
@@ -4454,6 +4726,21 @@ document.addEventListener("click", (event) => {
     void invoke<string>("export_cleanup_report", { format: "json" })
       .then((path) => showToast(`JSON 报告已导出：${path}`))
       .catch((error) => showToast(error instanceof Error ? error.message : String(error), true));
+    return;
+  }
+  if (button.id === "create-managed-python-pip-plan") {
+    const report = state.pythonIntegrity;
+    if (!report) return;
+    void (async () => {
+      showToast("正在生成受管 Python pip 修复计划");
+      try {
+        state.pythonRepairPlan = await invoke<PythonRepairPlan>("create_managed_python_pip_repair_plan", { pythonPath: report.pythonPath });
+        renderPythonRepairPlan();
+        showToast("pip 修复计划已生成；请核对后执行");
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : String(error), true);
+      }
+    })();
     return;
   }
   if (button.id === "accept-safety-disclaimer") {

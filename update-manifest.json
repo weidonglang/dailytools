@@ -1,13 +1,13 @@
 {
-  "version": "1.5.0",
+  "version": "1.5.1",
   "date": "2026-06-27",
   "notes": [
-    "新增环境可靠性中心：展示进程环境、用户环境、JAVA_HOME raw/expanded、PATH 命中顺序和工具来源",
-    "新增 Java 稳定修复计划：写入真实绝对 JAVA_HOME，保留未知 PATH，执行前备份并执行后验证",
-    "增强 Python/pip、Go、Maven、Gradle 与 Nacos 环境识别，减少环境医生误报和显示异常",
-    "新增统一风险等级、功能说明卡片、首次使用安全说明和报告风险尾部",
-    "CLI 新增 devenv env inspect/plan/apply/verify/backups/restore、java verify、python verify 和 safety risks"
+    "1.5.1 Final Stable：软著前稳定版收口，停止扩展新系统管家方向，集中强化开发环境诊断和安全说明",
+    "新增 Python 受管安装完整性检查：pip、venv、ssl、sqlite3、ctypes 为核心检查，tkinter 为可选提示",
+    "新增受管 Python pip 修复计划防误修边界，非受管 Python 只提示不自动修复",
+    "新增项目文件夹选择、IDEA/IntelliJ 配置只读分析、Nacos/Nexus/Maven/Gradle Java 消费者验证",
+    "新增 JDK/Python/Node/Maven/Gradle/Go 强验证报告，安装后登记前强化 java/javac/jar 等组件检查"
   ],
-  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.5.0/DevEnv.Manager_1.5.0_x64-setup.exe",
-  "sha256": "af191848729f533d99ab78662a52260f77340c3c4d55f1011f71f3f7b576e582"
+  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.5.1/DevEnv.Manager_1.5.1_x64-setup.exe",
+  "sha256": "645efdb09c2266b9eafe99e380eab43e0bf41a5f36bf8a017cac9806b3687609"
 }
