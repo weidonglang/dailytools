@@ -22,8 +22,8 @@
 
 ## SHA256
 
-- `DevEnv Manager_1.5.2_x64-setup.exe`: `1244d8888bf1e197fa59131381c4e52a897e94ceec518d743e4fdd9a20224a90`
-- `DevEnv Manager_1.5.2_x64_en-US.msi`: `d6d9f3e24ebd7d2e29c632b037f95db6a3c647c1cae25bc6f9a7c718f62ccf60`
+- `DevEnv.Manager_1.5.2_x64-setup.exe`: `1244d8888bf1e197fa59131381c4e52a897e94ceec518d743e4fdd9a20224a90`
+- `DevEnv.Manager_1.5.2_x64_en-US.msi`: `d6d9f3e24ebd7d2e29c632b037f95db6a3c647c1cae25bc6f9a7c718f62ccf60`
 
 ## 发布说明
 

@@ -4,6 +4,6 @@
   "notes": [
     "1.5.2 Patch：修复用户反馈与软件工程审查问题，强化安全边界、端口管理、MySQL 修复、Python/chsrc 可恢复性和质量门禁"
   ],
-  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.5.2/DevEnv%20Manager_1.5.2_x64-setup.exe",
+  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.5.2/DevEnv.Manager_1.5.2_x64-setup.exe",
   "sha256": "1244d8888bf1e197fa59131381c4e52a897e94ceec518d743e4fdd9a20224a90"
 }
