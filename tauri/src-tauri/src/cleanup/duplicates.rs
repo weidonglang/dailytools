@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 const MAX_DUPLICATE_ENTRIES: usize = 250_000;
 const MAX_HASH_CANDIDATES: usize = 50_000;
+const QUICK_HASH_BYTES: u64 = 256 * 1024;
 
 fn candidate_files(root: &Path, min_bytes: u64) -> Vec<(PathBuf, u64, Option<SystemTime>)> {
     let mut result = Vec::new();
@@ -66,6 +67,25 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn quick_sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut remaining = QUICK_HASH_BYTES;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = buffer.len().min(remaining as usize);
+        let read = file
+            .read(&mut buffer[..limit])
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        remaining = remaining.saturating_sub(read as u64);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 pub(crate) fn scan_duplicate_files(
     root: &Path,
     min_bytes: u64,
@@ -74,38 +94,46 @@ pub(crate) fn scan_duplicate_files(
     let size_groups = group_by_size(candidate_files(root, min_bytes));
     let mut result = Vec::new();
     for (size, candidates) in size_groups {
-        let mut hashes: HashMap<String, Vec<(PathBuf, Option<SystemTime>)>> = HashMap::new();
+        let mut quick_hashes: HashMap<String, Vec<(PathBuf, Option<SystemTime>)>> = HashMap::new();
         for (path, modified) in candidates {
-            if let Ok(hash) = sha256_file(&path) {
-                hashes.entry(hash).or_default().push((path, modified));
+            if let Ok(hash) = quick_sha256_file(&path) {
+                quick_hashes.entry(hash).or_default().push((path, modified));
             }
         }
-        for (hash, mut files) in hashes {
-            if files.len() < 2 {
-                continue;
+        for candidates in quick_hashes.into_values().filter(|items| items.len() > 1) {
+            let mut hashes: HashMap<String, Vec<(PathBuf, Option<SystemTime>)>> = HashMap::new();
+            for (path, modified) in candidates {
+                if let Ok(hash) = sha256_file(&path) {
+                    hashes.entry(hash).or_default().push((path, modified));
+                }
             }
-            files.sort_by_key(|item| std::cmp::Reverse(item.1));
-            let file_count = files.len();
-            let files = files
-                .into_iter()
-                .enumerate()
-                .map(|(index, (path, modified))| DuplicateFileItem {
-                    path: path.to_string_lossy().to_string(),
-                    modified_at: modified.and_then(system_time_string),
-                    keep_suggestion: if index == 0 {
-                        "较新文件，建议优先保留；仍需人工确认内容用途"
-                    } else {
-                        "内容与组内文件完全一致，可作为未来归档候选"
-                    }
-                    .to_string(),
-                })
-                .collect();
-            result.push(DuplicateGroup {
-                size,
-                hash,
-                files,
-                reclaimable_estimate: size.saturating_mul((file_count - 1) as u64),
-            });
+            for (hash, mut files) in hashes {
+                if files.len() < 2 {
+                    continue;
+                }
+                files.sort_by_key(|item| std::cmp::Reverse(item.1));
+                let file_count = files.len();
+                let files = files
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (path, modified))| DuplicateFileItem {
+                        path: path.to_string_lossy().to_string(),
+                        modified_at: modified.and_then(system_time_string),
+                        keep_suggestion: if index == 0 {
+                            "较新文件，建议优先保留；仍需人工确认内容用途"
+                        } else {
+                            "内容与组内文件完全一致，可作为未来归档候选"
+                        }
+                        .to_string(),
+                    })
+                    .collect();
+                result.push(DuplicateGroup {
+                    size,
+                    hash,
+                    files,
+                    reclaimable_estimate: size.saturating_mul((file_count - 1) as u64),
+                });
+            }
         }
     }
     result.sort_by_key(|group| std::cmp::Reverse(group.reclaimable_estimate));
@@ -151,5 +179,18 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].files.len(), 2);
         assert_eq!(result[0].reclaimable_estimate, 12);
+    }
+
+    #[test]
+    fn quick_hash_is_only_prefilter_before_full_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let mut first = vec![b'a'; QUICK_HASH_BYTES as usize];
+        first.extend_from_slice(b"tail-one");
+        let mut second = vec![b'a'; QUICK_HASH_BYTES as usize];
+        second.extend_from_slice(b"tail-two");
+        fs::write(root.path().join("a.bin"), first).unwrap();
+        fs::write(root.path().join("b.bin"), second).unwrap();
+        let result = scan_duplicate_files(root.path(), 1).unwrap();
+        assert!(result.is_empty());
     }
 }

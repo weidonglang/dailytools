@@ -1608,6 +1608,20 @@ async fn execute_c_drive_expansion(
 #[tauri::command]
 fn open_analysis_path(path: String) -> Result<OperationResult, String> {
     let path = PathBuf::from(path.trim());
+    if path.is_file() {
+        hidden_command("explorer.exe")
+            .arg("/select,")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| format!("打开并选中文件失败：{error}"))?;
+        return Ok(OperationResult {
+            success: true,
+            message: format!("已打开并选中：{}", display_path(path)),
+        });
+    }
+    if !path.exists() {
+        return Err("路径不存在，可能已移动或删除；请重新扫描后再打开。".to_string());
+    }
     let target = if path.is_dir() {
         path
     } else {
@@ -1616,7 +1630,7 @@ fn open_analysis_path(path: String) -> Result<OperationResult, String> {
             .ok_or_else(|| "无法识别所在目录".to_string())?
     };
     if !target.is_dir() {
-        return Err("目录不存在".to_string());
+        return Err("目录不存在，可能已移动或删除；请重新扫描后再打开。".to_string());
     }
     hidden_command("explorer.exe")
         .arg(&target)
@@ -12550,6 +12564,18 @@ mod tests {
             classify_jdk_candidate_source(r"C:\Program Files\Eclipse Adoptium\jdk-21\bin\java.exe"),
             "SystemInstaller"
         );
+    }
+
+    #[test]
+    fn open_analysis_path_reports_missing_path_as_rescan_needed() {
+        let missing = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("missing-file.zip")
+            .to_string_lossy()
+            .to_string();
+        let error = open_analysis_path(missing).unwrap_err();
+        assert!(error.contains("重新扫描"));
     }
 
     #[test]
