@@ -398,11 +398,18 @@ type PythonAnalysis = {
   currentPip?: PythonToolState;
   launcherPath: string;
   launcherOutput: string;
+  firstPythonOnPath: string;
+  firstPipOnPath: string;
+  pythonMPipAvailable: boolean;
+  managedPythonAvailable: boolean;
   discoveredPythons: PythonEntry[];
   discoveredPips: PythonEntry[];
   userPathEntryCount: number;
   currentTerminalMatchesUserPath: boolean;
   storeAliasRisk: boolean;
+  repairBlockers: string[];
+  recoveryActions: string[];
+  diagnosticReport: string;
   risks: string[];
   recommendations: string[];
   pipRepairCommand: string;
@@ -552,6 +559,14 @@ type PlatformReport = {
     cargoConfigExists: boolean;
   };
   chsrc: ToolState;
+  chsrcRecovery: {
+    missing: boolean;
+    explanation: string[];
+    scoopCommand: string;
+    wingetCommand: string;
+    officialUrl: string;
+    fallbackFeatures: string[];
+  };
   generatedAt: string;
 };
 
@@ -1426,6 +1441,7 @@ app.innerHTML = `
             <button data-chsrc-action="set">使用源 ID</button>
             <button data-chsrc-action="reset">恢复官方源</button>
           </div>
+          <div id="chsrc-recovery" class="notice-panel"></div>
           <pre id="chsrc-output" class="command-output compact-output">安装提示：scoop install chsrc，或通过 WinGet 安装 RubyMetric/chsrc。</pre>
         </section>
       </section>
@@ -2495,14 +2511,23 @@ function renderPythonAnalysis() {
   element.innerHTML = `
     <div class="runtime-list">${currentPython}${currentPip}</div>
     <div class="kv-list toolchain-kv">
+      <div><span>PATH 首个 python</span><strong>${escapeHtml(analysis.firstPythonOnPath || "未发现")}</strong></div>
+      <div><span>PATH 首个 pip</span><strong>${escapeHtml(analysis.firstPipOnPath || "未发现")}</strong></div>
+      <div><span>python -m pip</span><strong>${analysis.pythonMPipAvailable ? "可用" : "不可用"}</strong></div>
       <div><span>Python Launcher</span><strong>${escapeHtml(analysis.launcherPath || "未发现")}</strong></div>
       <div><span>用户 PATH</span><strong>${analysis.userPathEntryCount} 项 · ${analysis.currentTerminalMatchesUserPath ? "当前进程已同步" : "当前进程仍是旧 PATH"}</strong></div>
       <div><span>Store 执行别名</span><strong>${analysis.storeAliasRisk ? "可能抢占" : "未发现抢占"}</strong></div>
+      <div><span>受管 Python</span><strong>${analysis.managedPythonAvailable ? "已安装，可生成切换/修复计划" : "未安装，请先安装受管 Python"}</strong></div>
     </div>
     <div class="chip-row">${analysis.risks.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
+    ${analysis.repairBlockers.length ? `<section class="notice-panel"><h3>阻断修复计划的原因</h3><ul>${analysis.repairBlockers.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></section>` : ""}
+    <section class="notice-panel"><h3>下一步安全操作</h3><ul>${analysis.recoveryActions.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></section>
     <div class="toolbar compact">
       <button data-action="copy-text" data-copy="${escapeHtml(analysis.pipRepairCommand)}">${icon(Clipboard)}<span>复制 pip 修复命令</span></button>
       <button data-action="copy-text" data-copy="${escapeHtml(analysis.aliasSettingsCommand)}">${icon(Clipboard)}<span>复制别名设置命令</span></button>
+      <button data-action="open-python-alias-settings">${icon(FolderOpen)}<span>打开执行别名设置</span></button>
+      <button data-action="export-python-diagnostic">${icon(FileText)}<span>导出只读诊断</span></button>
+      <button data-action="copy-text" data-copy="${escapeHtml(analysis.diagnosticReport)}">${icon(Clipboard)}<span>复制诊断报告</span></button>
     </div>
     <div class="grid two compact-grid">
       <section>
@@ -2677,11 +2702,26 @@ function renderPlatforms() {
   const dotnet = document.querySelector<HTMLElement>("#dotnet-platform");
   const mirrors = document.querySelector<HTMLElement>("#mirror-platform");
   const chsrc = document.querySelector<HTMLElement>("#chsrc-status");
+  const chsrcRecovery = document.querySelector<HTMLElement>("#chsrc-recovery");
   const report = state.platforms;
   if (!go || !rust || !dotnet || !mirrors || !report) return;
   if (chsrc) {
     chsrc.textContent = report.chsrc.installed ? `已安装 · ${report.chsrc.version}` : "未安装";
     chsrc.className = `risk-chip ${report.chsrc.installed ? "risk-low" : "risk-medium"}`;
+  }
+  if (chsrcRecovery) {
+    const recovery = report.chsrcRecovery;
+    chsrcRecovery.innerHTML = `
+      <h3>${recovery.missing ? "chsrc 缺失闭环" : "chsrc 安全边界"}</h3>
+      <ul>${recovery.explanation.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+      ${recovery.missing ? `<div class="toolbar compact">
+        <button data-action="copy-text" data-copy="${escapeHtml(recovery.scoopCommand)}">${icon(Clipboard)}<span>复制 Scoop 命令</span></button>
+        <button data-action="copy-text" data-copy="${escapeHtml(recovery.wingetCommand)}">${icon(Clipboard)}<span>复制 WinGet 命令</span></button>
+        <button data-action="copy-text" data-copy="${escapeHtml(recovery.officialUrl)}">${icon(Clipboard)}<span>复制官方项目</span></button>
+        <button data-action="refresh-platforms">${icon(RefreshCw)}<span>重新检测</span></button>
+      </div>` : ""}
+      <div class="chip-row">${recovery.fallbackFeatures.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
+    `;
   }
 
   go.innerHTML = `
@@ -5219,6 +5259,18 @@ document.addEventListener("click", (event) => {
       .catch((error) => showToast(error instanceof Error ? error.message : String(error), true));
     return;
   }
+  if (action === "open-python-alias-settings") {
+    void invoke<OperationResult>("open_python_alias_settings")
+      .then((result) => showToast(result.message))
+      .catch((error) => showToast(error instanceof Error ? error.message : String(error), true));
+    return;
+  }
+  if (action === "export-python-diagnostic") {
+    void invoke<OperationResult>("export_python_diagnostic_report")
+      .then((result) => showToast(result.message))
+      .catch((error) => showToast(error instanceof Error ? error.message : String(error), true));
+    return;
+  }
   if (action === "open-app-config-dir") {
     void invoke<OperationResult>("open_app_config_dir")
       .then((result) => showToast(result.message))
@@ -5250,6 +5302,10 @@ document.addEventListener("click", (event) => {
   }
   if (action === "copy-safety-disclaimer") {
     void copyText(state.safetyDisclaimer || "DevEnv Manager safety disclaimer");
+    return;
+  }
+  if (action === "refresh-platforms") {
+    void inspectPlatforms();
     return;
   }
   if (action === "doctor-fix") {

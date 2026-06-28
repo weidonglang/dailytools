@@ -1597,6 +1597,29 @@ select {
   flex: 0 0 auto;
 }
 
+.notice-panel {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+  padding: 11px 12px;
+  border: 1px solid #dbe5e8;
+  border-radius: 8px;
+  background: #f8faf9;
+}
+
+.notice-panel h3 {
+  margin: 0;
+  color: #315f4d;
+  font-size: 13px;
+}
+
+.notice-panel ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #52616b;
+  line-height: 1.55;
+}
+
 .mysql-sections {
   display: grid;
   gap: 12px;

@@ -526,11 +526,18 @@ struct PythonAnalysis {
     current_pip: Option<PythonToolState>,
     launcher_path: String,
     launcher_output: String,
+    first_python_on_path: String,
+    first_pip_on_path: String,
+    python_m_pip_available: bool,
+    managed_python_available: bool,
     discovered_pythons: Vec<PythonEntry>,
     discovered_pips: Vec<PythonEntry>,
     user_path_entry_count: usize,
     current_terminal_matches_user_path: bool,
     store_alias_risk: bool,
+    repair_blockers: Vec<String>,
+    recovery_actions: Vec<String>,
+    diagnostic_report: String,
     risks: Vec<String>,
     recommendations: Vec<String>,
     pip_repair_command: String,
@@ -817,7 +824,19 @@ struct PlatformReport {
     dotnet: DotnetEnvironment,
     mirrors: MirrorCenter,
     chsrc: ToolState,
+    chsrc_recovery: ChsrcRecovery,
     generated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChsrcRecovery {
+    missing: bool,
+    explanation: Vec<String>,
+    scoop_command: String,
+    winget_command: String,
+    official_url: String,
+    fallback_features: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1618,6 +1637,20 @@ fn open_apps_features() -> Result<OperationResult, String> {
     Ok(OperationResult {
         success: true,
         message: "已打开 Windows 已安装的应用；请通过系统卸载入口操作".to_string(),
+    })
+}
+
+#[tauri::command]
+fn open_python_alias_settings() -> Result<OperationResult, String> {
+    hidden_command("explorer.exe")
+        .arg("ms-settings:appsfeatures-app")
+        .spawn()
+        .map_err(|error| format!("打开应用执行别名设置失败：{error}"))?;
+    Ok(OperationResult {
+        success: true,
+        message:
+            "已打开 Windows 应用执行别名设置；请手动关闭 python.exe / python3.exe Store Alias。"
+                .to_string(),
     })
 }
 
@@ -4638,6 +4671,8 @@ async fn analyze_python_environment() -> Result<PythonAnalysis, String> {
 }
 
 fn analyze_python_environment_blocking() -> PythonAnalysis {
+    let first_python_on_path = find_on_path("python").unwrap_or_default();
+    let first_pip_on_path = find_on_path("pip").unwrap_or_default();
     let current_python = detect_runtime("Python", "python", &["--version"]).map(|runtime| {
         let status = if runtime
             .executable
@@ -4659,6 +4694,7 @@ fn analyze_python_environment_blocking() -> PythonAnalysis {
     let python_m_pip = current_python.as_ref().and_then(|python| {
         run_command_output(PathBuf::from(&python.path), &["-m", "pip", "--version"], 30).ok()
     });
+    let python_m_pip_available = python_m_pip.is_some();
     let pip_runtime = detect_runtime("pip", "pip", &["--version"]);
     let current_pip = pip_runtime.map(|runtime| {
         let pip_output = runtime.version.clone();
@@ -4738,6 +4774,11 @@ fn analyze_python_environment_blocking() -> PythonAnalysis {
         item.source == "Microsoft Store"
             || item.path.to_ascii_lowercase().contains("\\windowsapps\\")
     });
+    let managed_python_available = load_paths()
+        .ok()
+        .and_then(|paths| load_installed(&paths).ok())
+        .map(|installed| !installed.pythons.is_empty())
+        .unwrap_or(false);
 
     let mut risks = Vec::new();
     if discovered_pythons.len() > 1 {
@@ -4756,6 +4797,22 @@ fn analyze_python_environment_blocking() -> PythonAnalysis {
     if current_pip.as_ref().map(|item| item.status.as_str()) != Some("正常") {
         risks.push("pip 与当前 python -m pip 不一致或当前 Python 缺少 pip".to_string());
     }
+    let mut repair_blockers = Vec::new();
+    if store_alias_risk {
+        repair_blockers.push("命中 WindowsApps Store Alias 时，DevEnv Manager 不会自动关闭别名或删除 WindowsApps PATH。".to_string());
+    }
+    if current_python.is_none() {
+        repair_blockers
+            .push("当前 PATH 没有可执行 python，不能对未知 Python 执行 ensurepip。".to_string());
+    }
+    if !python_m_pip_available {
+        repair_blockers.push(
+            "当前 python -m pip 不可用；只有受管 Python 才允许生成 pip 修复计划。".to_string(),
+        );
+    }
+    if !managed_python_available {
+        repair_blockers.push("尚未安装受管 Python；无法直接切换到 DevEnv 管理版本。".to_string());
+    }
     if risks.is_empty() {
         risks.push("未发现明显 Python 冲突".to_string());
     }
@@ -4769,23 +4826,106 @@ fn analyze_python_environment_blocking() -> PythonAnalysis {
                 .to_string(),
         );
     }
+    let mut recovery_actions = vec![
+        "打开 Windows 应用执行别名设置，人工关闭 python.exe / python3.exe Store Alias。"
+            .to_string(),
+        "重新检测 Python 环境，确认新终端和 IDE 已继承最新 PATH。".to_string(),
+        "导出只读 Python 诊断报告，发给自己或 issue 复盘。".to_string(),
+    ];
+    if managed_python_available {
+        recovery_actions
+            .push("切换到已安装的受管 Python，并生成用户级 PATH 修复计划。".to_string());
+    } else {
+        recovery_actions
+            .push("安装受管 Python，再用预览计划切换；不会删除系统 Python。".to_string());
+    }
+    let diagnostic_report = python_diagnostic_report(
+        current_python.as_ref(),
+        current_pip.as_ref(),
+        &launcher_path,
+        &launcher_output,
+        &first_python_on_path,
+        &first_pip_on_path,
+        python_m_pip_available,
+        store_alias_risk,
+        managed_python_available,
+        &risks,
+        &repair_blockers,
+        &recovery_actions,
+    );
 
     PythonAnalysis {
         current_python,
         current_pip,
         launcher_path,
         launcher_output,
+        first_python_on_path,
+        first_pip_on_path,
+        python_m_pip_available,
+        managed_python_available,
         discovered_pythons,
         discovered_pips,
         user_path_entry_count,
         current_terminal_matches_user_path,
         store_alias_risk,
+        repair_blockers,
+        recovery_actions,
+        diagnostic_report,
         risks,
         recommendations,
         pip_repair_command: "python -m ensurepip --upgrade; python -m pip install --upgrade pip"
             .to_string(),
         alias_settings_command: "start ms-settings:appsfeatures-app".to_string(),
     }
+}
+
+fn python_diagnostic_report(
+    current_python: Option<&PythonToolState>,
+    current_pip: Option<&PythonToolState>,
+    launcher_path: &str,
+    launcher_output: &str,
+    first_python_on_path: &str,
+    first_pip_on_path: &str,
+    python_m_pip_available: bool,
+    store_alias_risk: bool,
+    managed_python_available: bool,
+    risks: &[String],
+    repair_blockers: &[String],
+    recovery_actions: &[String],
+) -> String {
+    redact_report_text(&format!(
+        "# Python diagnostic\n\n默认 python: {}\n默认 pip: {}\nPATH 首个 python: {}\nPATH 首个 pip: {}\npy launcher: {}\npython -m pip: {}\nWindowsApps Alias: {}\n受管 Python: {}\n\n## py -0p\n{}\n\n## 风险\n{}\n\n## 阻断原因\n{}\n\n## 下一步\n{}\n",
+        current_python
+            .map(|item| format!("{} · {} · {}", item.status, item.version, item.path))
+            .unwrap_or_else(|| "未发现".to_string()),
+        current_pip
+            .map(|item| format!("{} · {} · {}", item.status, item.version, item.path))
+            .unwrap_or_else(|| "未发现".to_string()),
+        if first_python_on_path.is_empty() { "未发现" } else { first_python_on_path },
+        if first_pip_on_path.is_empty() { "未发现" } else { first_pip_on_path },
+        if launcher_path.is_empty() { "未发现" } else { launcher_path },
+        if python_m_pip_available { "可用" } else { "不可用" },
+        if store_alias_risk { "可能命中" } else { "未发现" },
+        if managed_python_available { "存在" } else { "不存在" },
+        launcher_output,
+        risks.iter().map(|item| format!("- {item}")).collect::<Vec<_>>().join("\n"),
+        repair_blockers.iter().map(|item| format!("- {item}")).collect::<Vec<_>>().join("\n"),
+        recovery_actions.iter().map(|item| format!("- {item}")).collect::<Vec<_>>().join("\n"),
+    ))
+}
+
+#[tauri::command]
+fn export_python_diagnostic_report() -> Result<OperationResult, String> {
+    let analysis = analyze_python_environment_blocking();
+    let reports = app_config_dir().join("reports");
+    fs::create_dir_all(&reports).map_err(|err| format!("创建报告目录失败：{err}"))?;
+    let target = reports.join(format!("python-diagnostic-{}.md", filename_timestamp()));
+    fs::write(&target, analysis.diagnostic_report)
+        .map_err(|err| format!("写入 Python 诊断报告失败：{err}"))?;
+    Ok(OperationResult {
+        success: true,
+        message: format!("已导出 Python 只读诊断报告：{}", display_path(target)),
+    })
 }
 
 fn learning_command_allowed(parts: &[String]) -> bool {
@@ -5573,6 +5713,7 @@ fn inspect_platform_toolchains_blocking() -> Result<PlatformReport, String> {
     let maven_settings_path = home.join(".m2/settings.xml");
     let gradle_init_path = home.join(".gradle/init.gradle");
     let chsrc = probe_tool("chsrc", resolve_tool(&paths, "chsrc"), &["--version"]);
+    let chsrc_recovery = chsrc_recovery(!chsrc.installed);
 
     Ok(PlatformReport {
         go: GoEnvironment {
@@ -5614,8 +5755,35 @@ fn inspect_platform_toolchains_blocking() -> Result<PlatformReport, String> {
             cargo_config_exists: cargo_config_path.is_file(),
         },
         chsrc,
+        chsrc_recovery,
         generated_at: current_timestamp(),
     })
+}
+
+fn chsrc_recovery(missing: bool) -> ChsrcRecovery {
+    ChsrcRecovery {
+        missing,
+        explanation: if missing {
+            vec![
+                "chsrc 是 RubyMetric 提供的多生态换源工具，用于查看、测速和切换软件源。".to_string(),
+                "当前未检测到 chsrc，因此统一换源按钮不可用；DevEnv Manager 不会静默安装第三方工具。".to_string(),
+                "不安装 chsrc 时，仍可使用 npm、pip、GOPROXY、Maven、Gradle、Cargo 的单项检测和配置。".to_string(),
+            ]
+        } else {
+            vec!["chsrc 已安装，统一换源操作仍会经过固定目标和源 ID 白名单。".to_string()]
+        },
+        scoop_command: "scoop install chsrc".to_string(),
+        winget_command: "winget install RubyMetric.chsrc".to_string(),
+        official_url: "https://github.com/RubyMetric/chsrc".to_string(),
+        fallback_features: vec![
+            "npm registry".to_string(),
+            "pip index-url".to_string(),
+            "GOPROXY".to_string(),
+            "Maven settings.xml".to_string(),
+            "Gradle init.gradle".to_string(),
+            "Cargo config.toml".to_string(),
+        ],
+    }
 }
 
 #[tauri::command]
@@ -7919,6 +8087,7 @@ pub fn run() {
             execute_c_drive_expansion,
             open_analysis_path,
             open_apps_features,
+            open_python_alias_settings,
             jdk_distributions,
             check_for_updates,
             download_update,
@@ -7955,6 +8124,7 @@ pub fn run() {
             export_doctor_report_json,
             doctor_report_text,
             analyze_python_environment,
+            export_python_diagnostic_report,
             preview_python_repair,
             apply_python_repair,
             inspect_toolchains,
@@ -11732,10 +11902,11 @@ fn redact_report_text(text: &str) -> String {
     for key in ["USERPROFILE", "HOME"] {
         if let Ok(value) = env::var(key) {
             if !value.trim().is_empty() {
-                result = result.replace(&value, "%USER_HOME%");
+                result = result.replace(&value, "%USERPROFILE%");
             }
         }
     }
+    result = redact_windows_user_paths(&result);
     result
         .lines()
         .map(|line| {
@@ -11754,6 +11925,27 @@ fn redact_report_text(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn redact_windows_user_paths(text: &str) -> String {
+    let mut result = String::new();
+    let mut rest = text;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(index) = lower.find("c:\\users\\") else {
+            result.push_str(rest);
+            break;
+        };
+        result.push_str(&rest[..index]);
+        let after_prefix = index + "c:\\users\\".len();
+        let tail = &rest[after_prefix..];
+        let end = tail
+            .find(['\\', '/', '\n', '\r', ' ', '\t', '"', '\''])
+            .unwrap_or(tail.len());
+        result.push_str("%USERPROFILE%");
+        rest = &tail[end..];
+    }
+    result
 }
 
 fn filename_timestamp() -> String {
@@ -12279,6 +12471,49 @@ mod tests {
         let other = r"pip 24.0 from C:\Python311\Lib\site-packages\pip (python 3.11)";
         assert!(same_python_package_location(left, right));
         assert!(!same_python_package_location(left, other));
+    }
+
+    #[test]
+    fn python_diagnostic_report_explains_store_alias_without_dangerous_fix() {
+        let python = PythonToolState {
+            path: r"C:\Users\Alice\AppData\Local\Microsoft\WindowsApps\python.exe".to_string(),
+            version: "Python 3.12".to_string(),
+            status: "风险".to_string(),
+            detail: "Microsoft Store".to_string(),
+        };
+        let report = python_diagnostic_report(
+            Some(&python),
+            None,
+            r"C:\Windows\py.exe",
+            r"-V:3.12 C:\Python312\python.exe",
+            &python.path,
+            "",
+            false,
+            true,
+            false,
+            &["Microsoft Store Python 执行别名可能抢占 python 命令".to_string()],
+            &["命中 WindowsApps Store Alias 时，DevEnv Manager 不会自动关闭别名或删除 WindowsApps PATH。".to_string()],
+            &["打开 Windows 应用执行别名设置，人工关闭 python.exe / python3.exe Store Alias。".to_string()],
+        );
+        assert!(report.contains("WindowsApps"));
+        assert!(report.contains("不会自动关闭别名"));
+        assert!(report.contains("%USERPROFILE%"));
+        assert!(!report.contains(r"C:\Users\Alice"));
+    }
+
+    #[test]
+    fn chsrc_missing_keeps_single_mirror_fallbacks() {
+        let recovery = chsrc_recovery(true);
+        assert!(recovery.missing);
+        assert!(recovery
+            .explanation
+            .iter()
+            .any(|item| item.contains("不会静默安装")));
+        assert!(recovery
+            .fallback_features
+            .contains(&"pip index-url".to_string()));
+        assert!(recovery.fallback_features.contains(&"GOPROXY".to_string()));
+        assert_eq!(recovery.scoop_command, "scoop install chsrc");
     }
 
     #[test]
