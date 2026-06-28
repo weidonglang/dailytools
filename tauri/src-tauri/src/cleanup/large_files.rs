@@ -7,6 +7,13 @@ use std::path::{Path, PathBuf};
 
 const MAX_ANALYSIS_ENTRIES: usize = 250_000;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LargeFileScanProgress {
+    pub visited_entries: usize,
+    pub candidate_count: usize,
+    pub truncated: bool,
+}
+
 fn normalized(path: &Path) -> String {
     path.to_string_lossy()
         .replace('/', "\\")
@@ -36,17 +43,37 @@ pub(crate) fn validate_analysis_root(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn collect_large_files(
     root: &Path,
     min_bytes: u64,
     limit: usize,
 ) -> Result<Vec<LargeFileItem>, String> {
+    collect_large_files_with_progress(root, min_bytes, limit, |_| {}, || false)
+}
+
+pub(crate) fn collect_large_files_with_progress<F, C>(
+    root: &Path,
+    min_bytes: u64,
+    limit: usize,
+    mut progress: F,
+    should_cancel: C,
+) -> Result<Vec<LargeFileItem>, String>
+where
+    F: FnMut(LargeFileScanProgress),
+    C: Fn() -> bool,
+{
     validate_analysis_root(root)?;
     let mut result = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     let mut visited = 0_usize;
+    let mut truncated = false;
     while let Some(path) = stack.pop() {
+        if should_cancel() {
+            return Err("扫描已取消".to_string());
+        }
         if visited >= MAX_ANALYSIS_ENTRIES {
+            truncated = true;
             break;
         }
         visited += 1;
@@ -86,24 +113,42 @@ pub(crate) fn collect_large_files(
         } else if let Ok(entries) = fs::read_dir(&path) {
             stack.extend(entries.flatten().map(|entry| entry.path()));
         }
+        if visited == 1 || visited.is_multiple_of(500) {
+            progress(LargeFileScanProgress {
+                visited_entries: visited,
+                candidate_count: result.len(),
+                truncated,
+            });
+        }
     }
     result.sort_by_key(|item| std::cmp::Reverse(item.size));
     result.truncate(limit.clamp(1, 100));
+    progress(LargeFileScanProgress {
+        visited_entries: visited,
+        candidate_count: result.len(),
+        truncated,
+    });
     Ok(result)
 }
 
-pub fn scan_large_files(
+pub fn scan_large_files_with_progress<F, C>(
     root: String,
     min_size_mb: u64,
     limit: usize,
-) -> Result<Vec<LargeFileItem>, String> {
+    progress: F,
+    should_cancel: C,
+) -> Result<Vec<LargeFileItem>, String>
+where
+    F: FnMut(LargeFileScanProgress),
+    C: Fn() -> bool,
+{
     let root = if root.trim().is_empty() {
         dirs::home_dir().ok_or_else(|| "无法识别用户目录".to_string())?
     } else {
         PathBuf::from(root.trim())
     };
     let minimum = min_size_mb.max(1).saturating_mul(1024 * 1024);
-    collect_large_files(&root, minimum, limit)
+    collect_large_files_with_progress(&root, minimum, limit, progress, should_cancel)
 }
 
 #[cfg(test)]
@@ -120,6 +165,27 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].size, 30);
         assert_eq!(result[1].size, 20);
+    }
+
+    #[test]
+    fn large_file_scan_reports_progress_and_honors_cancel() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("one.bin"), vec![0_u8; 10]).unwrap();
+        let mut observed = Vec::new();
+        let result = collect_large_files_with_progress(
+            root.path(),
+            1,
+            10,
+            |update| observed.push(update),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(observed.iter().any(|item| item.candidate_count == 1));
+
+        let error =
+            collect_large_files_with_progress(root.path(), 1, 10, |_| {}, || true).unwrap_err();
+        assert!(error.contains("取消"));
     }
 
     #[test]

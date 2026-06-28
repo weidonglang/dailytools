@@ -16,7 +16,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Mutex, OnceLock,
 };
 use std::time::Instant;
@@ -32,6 +32,7 @@ use winreg::{enums::*, RegKey};
 const APP_NAME: &str = "DevEnvManager";
 const SAFETY_DISCLAIMER_VERSION: u32 = 1;
 static SAVE_JSON_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MAINTENANCE_SCAN_CANCELLED: AtomicBool = AtomicBool::new(false);
 const MANAGED_PATHS: [&str; 8] = [
     r"%DEVENV_HOME%\current\jdk\bin",
     r"%DEVENV_HOME%\current\python",
@@ -1269,19 +1270,157 @@ fn export_cleanup_report(format: String) -> Result<String, String> {
 
 #[tauri::command]
 async fn scan_large_files(
+    app: tauri::AppHandle,
     root: String,
     min_size_mb: u64,
     limit: usize,
 ) -> Result<Vec<cleanup::LargeFileItem>, String> {
-    run_blocking(move || cleanup::scan_large_files(root, min_size_mb, limit)).await?
+    MAINTENANCE_SCAN_CANCELLED.store(false, Ordering::SeqCst);
+    let started = Instant::now();
+    emit_task_progress(
+        &app,
+        "大文件扫描",
+        2,
+        "正在预估扫描范围，上限 250000 个条目",
+    );
+    let progress_app = app.clone();
+    let result = run_blocking(move || {
+        cleanup::scan_large_files_with_progress(
+            root,
+            min_size_mb,
+            limit,
+            move |update| {
+                let percent =
+                    8 + ((update.visited_entries.min(50_000) as u64 * 82 / 50_000) as u8).min(82);
+                let truncated = if update.truncated {
+                    "；已达到扫描上限"
+                } else {
+                    ""
+                };
+                emit_task_progress(
+                    &progress_app,
+                    "大文件扫描",
+                    percent.min(95),
+                    &format!(
+                        "已访问 {} 项，候选 {} 个{}",
+                        update.visited_entries, update.candidate_count, truncated
+                    ),
+                );
+            },
+            || MAINTENANCE_SCAN_CANCELLED.load(Ordering::SeqCst),
+        )
+    })
+    .await?;
+    match result {
+        Ok(items) => {
+            MAINTENANCE_SCAN_CANCELLED.store(false, Ordering::SeqCst);
+            emit_task_progress(
+                &app,
+                "大文件扫描",
+                100,
+                &format!(
+                    "完成：{} 个候选，耗时 {} 秒",
+                    items.len(),
+                    started.elapsed().as_secs()
+                ),
+            );
+            Ok(items)
+        }
+        Err(err) => {
+            let percent = if err.contains("取消") { 100 } else { 0 };
+            emit_task_progress(&app, "大文件扫描", percent, &err);
+            Err(err)
+        }
+    }
 }
 
 #[tauri::command]
 async fn scan_duplicate_large_files(
+    app: tauri::AppHandle,
     root: String,
     min_size_mb: u64,
 ) -> Result<Vec<cleanup::DuplicateGroup>, String> {
-    run_blocking(move || cleanup::scan_duplicate_large_files(root, min_size_mb)).await?
+    MAINTENANCE_SCAN_CANCELLED.store(false, Ordering::SeqCst);
+    let started = Instant::now();
+    emit_task_progress(&app, "重复文件扫描", 2, "正在按大小收集候选文件");
+    let progress_app = app.clone();
+    let result = run_blocking(move || {
+        cleanup::scan_duplicate_large_files_with_progress(
+            root,
+            min_size_mb,
+            move |update| {
+                let (base, span, label) = match update.stage {
+                    "collect" => (5_u8, 30_u8, "收集候选"),
+                    "quick_hash" => (36_u8, 29_u8, "quick hash"),
+                    "full_hash" => (66_u8, 28_u8, "full hash"),
+                    _ => (95_u8, 0_u8, "整理结果"),
+                };
+                let work_units = match update.stage {
+                    "collect" => update.visited_entries.min(50_000),
+                    "quick_hash" => update.quick_hashed.min(update.candidate_count.max(1)),
+                    "full_hash" => update.full_hashed.min(update.candidate_count.max(1)),
+                    _ => update.candidate_count,
+                };
+                let total = if update.stage == "collect" {
+                    50_000
+                } else {
+                    update.candidate_count.max(1)
+                };
+                let percent = base + ((work_units as u64 * span as u64 / total as u64) as u8);
+                let truncated = if update.truncated {
+                    "；已达到扫描上限"
+                } else {
+                    ""
+                };
+                emit_task_progress(
+                    &progress_app,
+                    "重复文件扫描",
+                    percent.min(96),
+                    &format!(
+                        "{}：访问 {} 项，候选 {} 个，quick {}，full {}{}",
+                        label,
+                        update.visited_entries,
+                        update.candidate_count,
+                        update.quick_hashed,
+                        update.full_hashed,
+                        truncated
+                    ),
+                );
+            },
+            || MAINTENANCE_SCAN_CANCELLED.load(Ordering::SeqCst),
+        )
+    })
+    .await?;
+    match result {
+        Ok(groups) => {
+            MAINTENANCE_SCAN_CANCELLED.store(false, Ordering::SeqCst);
+            emit_task_progress(
+                &app,
+                "重复文件扫描",
+                100,
+                &format!(
+                    "完成：{} 组重复文件，耗时 {} 秒",
+                    groups.len(),
+                    started.elapsed().as_secs()
+                ),
+            );
+            Ok(groups)
+        }
+        Err(err) => {
+            let percent = if err.contains("取消") { 100 } else { 0 };
+            emit_task_progress(&app, "重复文件扫描", percent, &err);
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+fn cancel_maintenance_scan() -> Result<OperationResult, String> {
+    MAINTENANCE_SCAN_CANCELLED.store(true, Ordering::SeqCst);
+    Ok(OperationResult {
+        success: true,
+        message: "已请求取消当前扫描；正在等待后台任务安全退出。".to_string(),
+    })
 }
 
 #[tauri::command]
@@ -8062,6 +8201,7 @@ pub fn run() {
             export_cleanup_report,
             scan_large_files,
             scan_duplicate_large_files,
+            cancel_maintenance_scan,
             inspect_downloads,
             inspect_desktop,
             inspect_app_usage,

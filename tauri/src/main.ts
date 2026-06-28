@@ -1544,12 +1544,12 @@ app.innerHTML = `
           <div id="downloads-usage"><div class="empty">尚未分析下载目录</div></div>
         </section>
         <section class="maintenance-panel" data-maintenance-panel="large-files">
-          <div class="panel-head"><div class="panel-title">${icon(Search)}<h2>大文件 Top 100</h2></div><button id="scan-large-files">开始只读扫描</button></div>
+          <div class="panel-head"><div class="panel-title">${icon(Search)}<h2>大文件 Top 100</h2></div><div class="row-actions"><button id="scan-large-files">开始只读扫描</button><button id="cancel-large-scan" disabled>取消扫描</button></div></div>
           <div class="form-row"><input id="large-file-root" placeholder="扫描目录；留空使用用户目录" /><button data-pick-directory="large-file-root">${icon(FolderSearch)}<span>选择文件夹</span></button><input id="large-file-min" type="number" min="1" value="100" title="最小 MB" /><span>MB 以上</span></div>
           <div id="large-file-result" class="runtime-list"><div class="empty">选择或填写扫描范围后开始</div></div>
         </section>
         <section class="maintenance-panel" data-maintenance-panel="duplicates">
-          <div class="panel-head"><div class="panel-title">${icon(Boxes)}<h2>重复文件</h2></div><button id="scan-duplicates">按大小与 SHA256 扫描</button></div>
+          <div class="panel-head"><div class="panel-title">${icon(Boxes)}<h2>重复文件</h2></div><div class="row-actions"><button id="scan-duplicates">按大小与 SHA256 扫描</button><button id="cancel-duplicate-scan" disabled>取消扫描</button></div></div>
           <div class="scan-only-banner">${icon(Shield)}<span>只扫描用户明确选择的目录；先按大小分组，再读取候选内容计算 SHA256。不提供删除。</span></div>
           <div class="form-row"><input id="duplicate-root" placeholder="扫描目录；留空使用用户目录" /><button data-pick-directory="duplicate-root">${icon(FolderSearch)}<span>选择文件夹</span></button><input id="duplicate-min" type="number" min="1" value="10" title="最小 MB" /><span>MB 以上</span></div>
           <div id="duplicate-result"><div class="empty">尚未扫描重复文件</div></div>
@@ -4687,16 +4687,27 @@ document.querySelector("#inspect-downloads")?.addEventListener("click", async ()
     showToast(error instanceof Error ? error.message : String(error), true);
   }
 });
+
+function setScanBusy(scanSelector: string, cancelSelector: string, busy: boolean) {
+  const scanButton = document.querySelector<HTMLButtonElement>(scanSelector);
+  const cancelButton = document.querySelector<HTMLButtonElement>(cancelSelector);
+  if (scanButton) scanButton.disabled = busy;
+  if (cancelButton) cancelButton.disabled = !busy;
+}
+
 document.querySelector("#scan-large-files")?.addEventListener("click", async () => {
   const root = document.querySelector<HTMLInputElement>("#large-file-root")?.value.trim() || "";
   const minSizeMb = Number(document.querySelector<HTMLInputElement>("#large-file-min")?.value || "100");
   showToast("正在只读扫描大文件；不会读取文件内容");
+  setScanBusy("#scan-large-files", "#cancel-large-scan", true);
   try {
     state.largeFiles = await invoke<LargeFileItem[]>("scan_large_files", { root, minSizeMb, limit: 100 });
     renderLargeFiles();
     showToast(`大文件扫描完成：${state.largeFiles.length} 项`);
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error), true);
+  } finally {
+    setScanBusy("#scan-large-files", "#cancel-large-scan", false);
   }
 });
 document.querySelector("#scan-duplicates")?.addEventListener("click", async () => {
@@ -4704,13 +4715,24 @@ document.querySelector("#scan-duplicates")?.addEventListener("click", async () =
   const minSizeMb = Number(document.querySelector<HTMLInputElement>("#duplicate-min")?.value || "10");
   if (!window.confirm(`将只在“${root || "用户目录"}”内对 ${minSizeMb} MB 以上、大小相同的候选文件计算 SHA256。不会上传或删除文件，确定继续吗？`)) return;
   showToast("正在按大小分组并计算重复候选 SHA256");
+  setScanBusy("#scan-duplicates", "#cancel-duplicate-scan", true);
   try {
     state.duplicateGroups = await invoke<DuplicateGroup[]>("scan_duplicate_large_files", { root, minSizeMb });
     renderDuplicates();
     showToast(`重复文件扫描完成：${state.duplicateGroups.length} 组`);
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error), true);
+  } finally {
+    setScanBusy("#scan-duplicates", "#cancel-duplicate-scan", false);
   }
+});
+document.querySelector("#cancel-large-scan")?.addEventListener("click", async () => {
+  const result = await invoke<OperationResult>("cancel_maintenance_scan");
+  showToast(result.message);
+});
+document.querySelector("#cancel-duplicate-scan")?.addEventListener("click", async () => {
+  const result = await invoke<OperationResult>("cancel_maintenance_scan");
+  showToast(result.message);
 });
 document.querySelector("#inspect-app-usage")?.addEventListener("click", async () => {
   showToast("正在只读统计常见应用、游戏库与已安装软件");

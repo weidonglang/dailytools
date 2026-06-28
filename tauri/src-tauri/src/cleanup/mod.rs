@@ -32,9 +32,9 @@ pub use desktop::inspect_desktop;
 pub use dev_cache::clean_dev_cache;
 pub use disk::inspect_disk_overview;
 pub use downloads::inspect_downloads;
-pub use duplicates::scan_duplicate_large_files;
+pub use duplicates::scan_duplicate_large_files_with_progress;
 pub use expansion::{create_c_drive_expansion_plan, execute_c_drive_expansion};
-pub use large_files::scan_large_files;
+pub use large_files::scan_large_files_with_progress;
 pub use migration::execute_move_plan;
 pub use model::{
     AppUsageReport, CleanupPlan, CleanupResult, CleanupScanReport, DiskVolumeInfo, DuplicateGroup,
