@@ -1501,6 +1501,33 @@ select {
   line-height: 1.55;
 }
 
+.feature-help-shell {
+  display: grid;
+  gap: 8px;
+}
+
+.feature-help-controls {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.feature-help-strip {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  min-height: 38px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  background: #f8faf9;
+}
+
+.feature-help-strip small {
+  margin-left: auto;
+  color: #66757e;
+}
+
 .effective-environment-panel {
   margin-top: 14px;
 }

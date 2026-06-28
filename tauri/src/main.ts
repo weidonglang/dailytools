@@ -4126,7 +4126,31 @@ function renderFeatureHelp(view = document.querySelector(".nav-item.active")?.ge
       info.requiresAdmin ? "需要管理员权限时会明确提示。" : "不会静默请求管理员权限。",
     ].map(escapeHtml),
   );
-  slot.innerHTML = card;
+  const collapsed = featureHelpCollapsed(view);
+  slot.innerHTML = collapsed
+    ? `<button class="feature-help-strip" data-action="feature-help-expand" data-help-view="${escapeHtml(view)}">${icon(FileText)}<span>${escapeHtml(info.title)}</span><small>点击展开说明</small></button>`
+    : `<section class="feature-help-shell" data-help-view="${escapeHtml(view)}">
+        <div class="feature-help-controls">
+          <label class="toggle-row"><input type="checkbox" data-action="feature-help-collapse-next" data-help-view="${escapeHtml(view)}" ${collapsed ? "checked" : ""} /><span>下次进入此页面默认折叠</span></label>
+        </div>
+        ${card}
+      </section>`;
+}
+
+function featureHelpCollapsed(view: string) {
+  try {
+    return window.localStorage.getItem(`devenv.featureHelp.collapsed.${view}`) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function setFeatureHelpCollapsed(view: string, collapsed: boolean) {
+  try {
+    window.localStorage.setItem(`devenv.featureHelp.collapsed.${view}`, collapsed ? "true" : "false");
+  } catch {
+    // localStorage can be unavailable in recovery contexts; default-expanded remains safe.
+  }
 }
 
 function escapeHtml(value: string) {
@@ -5328,6 +5352,12 @@ document.addEventListener("click", (event) => {
     void inspectPlatforms();
     return;
   }
+  if (action === "feature-help-expand") {
+    const view = button.dataset.helpView || document.querySelector(".nav-item.active")?.getAttribute("data-view") || "overview";
+    setFeatureHelpCollapsed(view, false);
+    renderFeatureHelp(view);
+    return;
+  }
   if (action === "doctor-fix") {
     const fix = button.dataset.fix || "";
     void runDoctorAction(fix).catch((error) => showToast(error instanceof Error ? error.message : String(error), true));
@@ -5629,6 +5659,13 @@ window.addEventListener("error", (event) => {
 
 window.addEventListener("unhandledrejection", (event) => {
   enterSafeMode(event.reason, "未处理的异步错误");
+});
+
+document.addEventListener("change", (event) => {
+  const input = (event.target as HTMLElement).closest<HTMLInputElement>('input[data-action="feature-help-collapse-next"]');
+  if (!input) return;
+  const view = input.dataset.helpView || document.querySelector(".nav-item.active")?.getAttribute("data-view") || "overview";
+  setFeatureHelpCollapsed(view, input.checked);
 });
 
 window.addEventListener(
