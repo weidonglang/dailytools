@@ -15,7 +15,10 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
 use std::time::Instant;
 use tauri::Emitter;
 use tempfile::Builder as TempBuilder;
@@ -27,6 +30,7 @@ use std::os::windows::process::CommandExt;
 use winreg::{enums::*, RegKey};
 
 const APP_NAME: &str = "DevEnvManager";
+static SAVE_JSON_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MANAGED_PATHS: [&str; 8] = [
     r"%DEVENV_HOME%\current\jdk\bin",
     r"%DEVENV_HOME%\current\python",
@@ -8560,9 +8564,14 @@ fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("创建目录失败：{err}"))?;
     }
-    let temp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(OsStr::to_str).unwrap_or("json")
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("config.json");
+    let temp = path.with_file_name(format!(
+        "{file_name}.{}.{}.tmp",
+        std::process::id(),
+        SAVE_JSON_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let text = serde_json::to_string_pretty(value).map_err(|err| err.to_string())?;
     fs::write(&temp, text).map_err(|err| format!("写入配置失败：{err}"))?;
