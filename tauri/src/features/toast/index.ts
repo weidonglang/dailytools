@@ -6,6 +6,10 @@ type ToastOptions = {
 
 let toastTimer: number | null = null;
 
+function isPendingMessage(message: string) {
+  return /^(正在|请稍候|等待|准备|校验中|扫描中|分析中|下载中|运行中|刷新中)/.test(message.trim()) || message.includes("正在");
+}
+
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, (char) => {
     const entities: Record<string, string> = {
@@ -52,7 +56,9 @@ export function showToast(message: string, isError = false, options: ToastOption
   toast.hidden = false;
   toast.classList.toggle("error", isError);
   toast.classList.toggle("warning", kind === "warning");
-  const duration = options.sticky ? 0 : options.durationMs ?? (isError ? 0 : kind === "warning" ? 9000 : 5000);
+  const duration = options.sticky
+    ? 0
+    : options.durationMs ?? (isError ? 0 : isPendingMessage(message) ? 0 : kind === "warning" ? 9000 : 5000);
   if (duration > 0) {
     toastTimer = window.setTimeout(() => hideToast(), duration);
   }

@@ -25,7 +25,7 @@ import {
   type IconNode,
 } from "lucide";
 import { envReliabilityIntro } from "./envReliability";
-import { askForConfirmation, confirmRisk, disclaimerPanel, featureHelpCard } from "./features/safety";
+import { askForConfirmation, confirmRisk, disclaimerPanel } from "./features/safety";
 import { fileDirectory } from "./features/cleanup";
 import { projectConfigurationPlanId } from "./features/jdk";
 import { MYSQL_PERMISSION_UNKNOWN_HELP, mysqlPathValue } from "./features/mysql";
@@ -173,7 +173,7 @@ app.innerHTML = `
       </div>
       <details id="view-guide" class="view-guide">
         <summary>${icon(FileText)}<span>页面使用指南</span></summary>
-        <p id="view-guide-text">先看系统快照和当前生效工具；需要深入排查时再进入环境医生。</p>
+        <div id="view-guide-text" class="view-guide-body">先看系统快照和当前生效工具；需要深入排查时再进入环境医生。</div>
       </details>
       <div id="feature-help-slot"></div>
 
@@ -2270,6 +2270,7 @@ async function refreshBase() {
   renderDuplicates();
   renderAppUsage();
   renderPorts();
+  renderViewGuide();
   renderFeatureHelp();
   const autoCheckUpdates = document.querySelector<HTMLInputElement>("#auto-check-updates");
   if (autoCheckUpdates) autoCheckUpdates.checked = config.settings.autoCheckUpdate;
@@ -3002,10 +3003,32 @@ function renderFolderUsage(target: string, report: FolderUsageReport | null, key
   const element = document.querySelector<HTMLElement>(target);
   if (!element || !report) return;
   const rescanTarget = key.includes("desktop") ? "desktop" : "downloads";
-  element.innerHTML = `<div class="project-summary"><strong>${escapeHtml(report.name)} · ${formatBytes(report.totalBytes)}</strong><span>${escapeHtml(report.path)}</span></div>
-    <div class="folder-usage-grid">${paginate(key, report.categories, (category) => `<details class="folder-usage-card"><summary><div><strong>${escapeHtml(category.name)}</strong><span>${formatBytes(category.size)}</span></div><small>${escapeHtml(category.suggestion)}</small></summary><div class="runtime-list compact-file-list">${category.details.length ? category.details.map((item) => renderFileDetail(item, rescanTarget)).join("") : `<div class="empty">这个分类下没有可展示的 Top 文件明细</div>`}</div></details>`)}</div>
-    <section class="panel nested-panel"><div class="panel-head"><div class="panel-title">${icon(Search)}<h3>Top 文件明细</h3></div><button data-action="rescan-folder" data-target="${rescanTarget}">${icon(RefreshCw)}<span>重新扫描</span></button></div><div class="runtime-list compact-file-list">${report.topFiles.length ? report.topFiles.map((item) => renderFileDetail(item, rescanTarget)).join("") : `<div class="empty">没有可展示的文件明细</div>`}</div></section>
-    <ul>${[...report.suggestions, ...report.warnings].map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+  const categoryKey = `${key}-categories`;
+  const topFileKey = `${key}-top-files`;
+  element.innerHTML = `
+    <section class="folder-usage-summary">
+      <div>
+        <strong>${escapeHtml(report.name)}</strong>
+        <span>${formatBytes(report.totalBytes)}</span>
+      </div>
+      <small title="${escapeHtml(report.path)}">${escapeHtml(report.path)}</small>
+      <div class="folder-usage-notes">${[...report.suggestions, ...report.warnings].map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
+    </section>
+    <section class="folder-usage-section">
+      <div class="section-heading">
+        <div><h3>分类占用</h3><small>按文件类型、时间和用途分组；展开分类可查看该类 Top 文件。</small></div>
+        <span>${report.categories.length} 类</span>
+      </div>
+      <div class="folder-usage-grid">${paginate(categoryKey, report.categories, (category) => `<details class="folder-usage-card"><summary><div><strong>${escapeHtml(category.name)}</strong><span>${formatBytes(category.size)}</span></div><small>${escapeHtml(category.suggestion)}</small></summary><div class="runtime-list compact-file-list">${category.details.length ? paginate(`${categoryKey}-${category.name}`, category.details, (item) => renderFileDetail(item, rescanTarget), 4) : `<div class="empty">这个分类下没有可展示的 Top 文件明细</div>`}</div></details>`, 4)}</div>
+    </section>
+    <section class="folder-usage-section top-files-section">
+      <div class="section-heading">
+        <div><h3>Top 文件明细</h3><small>优先展示最占空间的具体文件；每页最多 6 项，便于逐个定位和复制路径。</small></div>
+        <button data-action="rescan-folder" data-target="${rescanTarget}">${icon(RefreshCw)}<span>重新扫描</span></button>
+      </div>
+      <div class="file-detail-grid">${report.topFiles.length ? paginate(topFileKey, report.topFiles, (item) => renderFileDetail(item, rescanTarget), 6) : `<div class="empty">没有可展示的文件明细</div>`}</div>
+    </section>
+  `;
 }
 
 function renderFileDetail(item: LargeFileItem, rescanTarget: string) {
@@ -3014,21 +3037,22 @@ function renderFileDetail(item: LargeFileItem, rescanTarget: string) {
   const extension = item.extension || "无扩展名";
   const locateLabel = item.exists ? "选中文件" : "尝试定位";
   return `<article class="runtime file-detail-card ${item.exists ? "" : "missing-file"}">
-    <div>
+    <div class="file-detail-head">
       <strong title="${escapeHtml(item.fileName || item.path)}">${escapeHtml(item.fileName || item.path)}</strong>
-      <span>${formatBytes(item.size)} · ${escapeHtml(modified)}</span>
+      <span>${formatBytes(item.size)}</span>
     </div>
-    <small title="${escapeHtml(item.path)}">完整路径：${escapeHtml(item.path)}</small>
-    <small title="${escapeHtml(directory)}">所在目录：${escapeHtml(directory)}</small>
-    <div class="file-facts">
+    <div class="file-detail-meta">
       <span>${escapeHtml(extension)}</span>
       <span>${escapeHtml(item.fileType)}</span>
       <span>${escapeHtml(item.sourceCategory)}</span>
+      <span>${escapeHtml(modified)}</span>
       <span>${item.exists ? "仍存在" : "已移动或删除"}</span>
       <span>${item.canLocate ? "可定位" : "不可定位"}</span>
     </div>
+    <small title="${escapeHtml(item.path)}">完整路径：${escapeHtml(item.path)}</small>
+    <small title="${escapeHtml(directory)}">所在目录：${escapeHtml(directory)}</small>
     <small>${escapeHtml(item.openStatus || item.suggestion)}</small>
-    <div class="row-actions">
+    <div class="row-actions file-actions">
       <button data-action="open-analysis-path" data-path="${escapeHtml(directory)}" ${item.canLocate ? "" : "disabled"}>打开所在目录</button>
       <button data-action="open-analysis-path" data-path="${escapeHtml(item.path)}" ${item.canOpen || item.canLocate ? "" : "disabled"}>${locateLabel}</button>
       <button data-action="copy-text" data-copy="${escapeHtml(item.path)}">复制完整路径</button>
@@ -3208,21 +3232,7 @@ function activateView(view: string) {
   document.querySelectorAll(".view").forEach((item) => {
     item.classList.toggle("active", item.id === `view-${view}`);
   });
-  const guides: Record<string, string> = {
-    overview: "用途：查看当前真实生效的工具、端口数量、PATH 风险和版本更新。适合刚打开软件时先确认状态。第一步点“刷新”或“检查更新”。这里只读读取环境和版本清单；不会写环境变量、安装软件或停止服务。检查失败时可继续使用其它页面，并复制错误给维护者。",
-    doctor: "用途：把 PATH、JAVA_HOME、Python、端口和缓存问题汇总成证据。适合不知道哪里坏了时使用。第一步点“一键诊断”。诊断、导出和复制报告只读；“安全修复”会修改当前用户 PATH/受管环境变量，执行前会预览风险并走后端 token。失败后先看每条问题的详情，再导出报告。",
-    ports: "用途：识别本机监听端口、冲突来源、进程路径、父进程和服务名。适合排查 8080/3306/5173 等被占用。第一步点“扫描”，再点冲突徽标或详情按钮。扫描只读；结束进程/停止服务会修改运行状态并要求确认/token。系统关键进程不会显示结束入口。",
-    runtimes: "用途：管理和验证 JDK、Node、Python、Maven、Gradle、Go。适合切换受管版本或核对外部 JDK。第一步点“检查当前 JDK”或“发现版本”。发现/验证只读；切换受管版本会修改 current 指针和用户环境。外部 JDK 只可验证或生成 JAVA_HOME 计划，不会被卸载或接管。",
-    environment: "用途：检查用户级环境变量可靠性，并生成 JAVA_HOME/PATH 修复计划。适合 java/javac、Maven、Gradle、pip 生效不一致。第一步点“检查可靠性”。检查和预览只读；应用计划会写当前用户环境变量并先备份。失败后重新检查可靠性，必要时从备份列表恢复。",
-    project: "用途：只读识别项目类型、推荐运行时、IDE 配置和项目端口。适合启动项目或修改项目端口前确认。第一步选择项目目录再点“分析”。分析、IDEA 读取、Java 消费者验证只读；应用配置/改端口会备份项目文件并要求 token。失败后查看输出并恢复备份。",
-    toolchains: "用途：检查 Git/SSH、Node 包管理器、Python/pip 和常用工具链状态。适合配置 Git 身份、SSH key、npm/pip 源。第一步点“全面检查”。检查只读；保存身份、生成 SSH key、切换源会写用户配置并提示备份/影响。失败后复制命令或打开对应工具官方配置。",
-    platforms: "用途：检查 Go、Rust、.NET、chsrc 和镜像配置。适合处理 GOPROXY、Maven/Gradle/Cargo 镜像。第一步点“全面检查”。检查和测速只读；写镜像配置会先备份配置文件并确认。不会替代包管理器安装运行时；失败后可恢复最近备份或复制官方命令。",
-    learning: "用途：学习并运行固定的只读检查命令。适合确认 where/version/doctor 输出。第一步选择或输入只读命令再运行。这里不会安装工具、写配置、结束进程或清理文件。命令被拒绝时说明它不是学习中心允许的只读检查。",
-    maintenance: "用途：分析空间占用、桌面/下载大文件、重复文件、应用占用和低风险清理。适合找出具体大文件并定位。第一步点“开始体检”或对应页的“只读分析”。扫描和定位只读；清理/归档/搬家会先生成计划、备份提示并要求 token。失败后重新扫描，不会自动删除未选择文件。",
-    toolbox: "用途：承载命令面板、本地服务、Docker/WSL 和卸载等高级入口。适合有明确目标时使用。第一步先展开对应高级区并阅读说明。服务检查和日志只读；启动/停止服务、Docker/WSL 系统操作、自卸载会修改系统状态或打开系统工具并要求确认/token。失败后不要重复点击，先复制日志。",
-  };
-  const guide = document.querySelector<HTMLElement>("#view-guide-text");
-  if (guide) guide.textContent = guides[view] || guides.overview;
+  renderViewGuide(view);
   renderFeatureHelp(view);
 }
 
@@ -3265,53 +3275,142 @@ const VIEW_FEATURE_MAP: Record<string, string> = {
   toolbox: "command-panel",
 };
 
-function renderFeatureHelp(view = document.querySelector(".nav-item.active")?.getAttribute("data-view") || "overview") {
+function currentView() {
+  return document.querySelector(".nav-item.active")?.getAttribute("data-view") || "overview";
+}
+
+type GuideDefinition = {
+  title: string;
+  intro: string;
+  steps: string[];
+  readonly: string[];
+  writes: string[];
+  safety: string[];
+};
+
+const VIEW_GUIDES: Record<string, GuideDefinition> = {
+  overview: {
+    title: "总览",
+    intro: "总览用于快速判断这台 Windows 开发机当前是否健康：它聚合当前生效运行时、PATH 风险、端口数量、版本更新状态和关键提醒。适合刚打开软件时先看一眼，再决定去环境医生、端口、项目或空间分析页面继续排查。",
+    steps: ["先点“刷新”读取最新快照。", "如果看到 PATH、JAVA_HOME、端口或更新异常，再跳转到对应页面。", "需要给别人描述问题时，优先复制总览和环境医生报告。"],
+    readonly: ["读取当前配置、受管运行时清单、版本更新清单和本机状态。", "不会安装软件、修改环境变量、停止进程或清理文件。"],
+    writes: ["总览页本身没有写入动作；更新下载/安装会跳到工具箱更新流程处理。"],
+    safety: ["如果检查失败，不影响其它页面继续使用。", "更新检查失败通常是网络或 GitHub 访问问题，可以复制错误后稍后重试。"],
+  },
+  doctor: {
+    title: "环境医生",
+    intro: "环境医生把 PATH、JAVA_HOME、Python/pip、端口、缓存和常见配置问题整理成可解释的证据。适合“不知道哪里坏了”的场景，用它先定位原因，再决定是否执行安全修复。",
+    steps: ["先点“一键诊断”。", "逐条查看警告和建议，优先处理影响当前项目启动的问题。", "执行修复前先看页面里的 diff、备份名和风险等级。"],
+    readonly: ["诊断、导出报告、复制建议和网络/端口检查是只读。", "报告会脱敏本机用户名、令牌和敏感路径片段。"],
+    writes: ["安全修复可能写入当前用户 PATH 或受管环境变量。", "PATH 清理会移除重复、失效或旧 DevEnv 受管残留项。"],
+    safety: ["修改类动作需要后端 confirmation token，并在执行前建立可恢复记录。", "失败后先重新诊断，再从备份列表恢复，不要反复点击同一个修复按钮。"],
+  },
+  ports: {
+    title: "端口管理",
+    intro: "端口管理用于识别本机监听端口、进程身份、冲突证据、父进程、Windows 服务和历史记录。适合排查 8080、3306、5173、6379 等端口被占用或误判的问题。",
+    steps: ["先点“扫描”。", "点击冲突徽标或详情按钮查看证据来源。", "用搜索、排序和快捷筛选缩小到数据库、Web、桌面应用或未知进程。"],
+    readonly: ["扫描、详情、复制 curl/连接命令、打开进程位置都是只读。", "端口身份不会只凭端口号下结论，会结合进程名、路径、命令行、服务名和冲突证据。"],
+    writes: ["安全结束进程、停止服务会改变运行状态。", "系统关键进程、PID 过低或高风险进程不会显示结束入口。"],
+    safety: ["结束进程和停止服务都需要后端 token。", "如果端口属于数据库或系统服务，优先用服务管理入口停止，不建议直接杀进程。"],
+  },
+  runtimes: {
+    title: "运行时",
+    intro: "运行时页面用于发现、验证和切换 JDK、Node.js、Python、Maven、Gradle、Go 等开发工具。它区分 DevEnv 受管版本、系统安装版本、IDE 自带版本和外部手动路径。",
+    steps: ["先点“发现版本”刷新受管和外部候选。", "JDK 问题优先点“检查当前 JDK”或对外部 JDK 做只读验证。", "确认 java/javac/jar 都可用后，再生成 JAVA_HOME 稳定计划。"],
+    readonly: ["发现版本、外部 JDK 验证、java/javac/jar 检查是只读。", "外部 JDK 不会被卸载、移动或接管。"],
+    writes: ["切换受管运行时会更新 current 指针，并可能配合环境页写入用户环境变量。", "安装受管版本会下载到 DevEnv 管理目录。"],
+    safety: ["写入环境变量前会先生成计划和备份。", "IDE 捆绑运行时默认只展示和验证，不作为卸载目标。"],
+  },
+  environment: {
+    title: "环境变量",
+    intro: "环境变量页面专门检查用户级 JAVA_HOME、DEVENV_HOME、PATH 顺序、java/javac/pip 命中和 Maven/Gradle 使用的 Java。适合处理终端里版本和软件界面看到的不一致。",
+    steps: ["先点“检查可靠性”。", "确认冲突来源后再生成修复计划。", "应用计划前核对 diff、备份名和是否需要重启终端。"],
+    readonly: ["可靠性检查、修复计划预览、备份列表查看、报告导出是只读。", "页面会展示 raw 值、展开后的路径和命令验证结果。"],
+    writes: ["应用计划会写当前用户环境变量。", "恢复环境会用最近备份替换用户级配置。"],
+    safety: ["应用、恢复和 PATH 清理都需要后端 token。", "如果预览后环境变量发生变化，后端会拒绝写入并要求重新预览。"],
+  },
+  project: {
+    title: "项目",
+    intro: "项目页用于识别项目类型、读取 IDE 配置、验证 Java 消费者、生成 VS Code/IDEA 配置预览，以及备份后修改项目端口。适合启动项目、接手项目或排查端口冲突前使用。",
+    steps: ["先选择项目目录；默认不会自动填本机路径。", "点击“分析”识别项目类型和运行建议。", "需要写配置或改端口时，先生成预览并核对文件内容。"],
+    readonly: ["项目分析、IDEA 配置读取、Nacos/Nexus Java 验证和端口配置扫描是只读。", "页面只读取常见安全配置文件，不深扫源码内容。"],
+    writes: ["应用项目配置会写 VS Code/IDEA 等项目配置文件。", "修改端口会备份原文件并只替换识别到的端口项。"],
+    safety: ["写项目文件和端口修改都需要 token。", "后端会限制写入路径，避免越界修改项目外文件。"],
+  },
+  toolchains: {
+    title: "工具链",
+    intro: "工具链页面向 Git、SSH、Node 包管理器、Python/pip 和常用 CLI 配置。适合首次配置开发机、修复 pip/npm 源或确认命令是否可用。",
+    steps: ["先点“全面检查”。", "Git 身份、SSH key、pip/npm 源按页面提示逐项处理。", "执行前阅读会写入哪些用户配置文件。"],
+    readonly: ["检查命令版本、读取配置状态、复制建议命令是只读。", "命令输出会做基础脱敏。"],
+    writes: ["保存 Git 身份、生成 SSH key、切换 pip/npm/chsrc 源会写用户配置。", "受管 pip 修复会先生成计划再执行。"],
+    safety: ["写配置前会提示影响范围，必要时生成备份。", "失败后优先复制错误和命令输出，不要手动删除配置目录。"],
+  },
+  platforms: {
+    title: "平台与镜像",
+    intro: "平台页用于检查 Go、Rust、.NET、chsrc 和镜像源配置。它更像开发平台体检，不替代各生态成熟包管理器。",
+    steps: ["先点“全面检查”。", "根据生态选择 Go/Rust/.NET 或 chsrc 操作。", "切换镜像前确认团队或项目是否有固定要求。"],
+    readonly: ["版本检查、镜像测速和配置读取是只读。", "不会自动安装或卸载生态运行时。"],
+    writes: ["镜像切换会写对应工具的用户配置文件。", "chsrc 操作会调用受控白名单命令。"],
+    safety: ["写入前会备份或提示可恢复路径。", "如果公司网络有代理/内网源，先复制现有配置再改。"],
+  },
+  learning: {
+    title: "学习中心",
+    intro: "学习中心只运行固定白名单里的只读检查命令，帮助你理解 where、version、doctor 等命令输出。适合学习排查思路，而不是执行修复。",
+    steps: ["选择预置命令或输入只读命令。", "运行后看 stdout/stderr 和安全评估。", "把输出带到其它页面决定下一步。"],
+    readonly: ["允许的命令只用于查看版本、路径和诊断信息。", "被拒绝的命令会说明原因。"],
+    writes: ["学习中心不安装工具、不改配置、不清理文件、不结束进程。"],
+    safety: ["PowerShell/cmd、破坏性 Git、磁盘/注册表/权限类命令会被拦截。", "不要粘贴看不懂的网页命令。"],
+  },
+  maintenance: {
+    title: "空间分析",
+    intro: "空间分析用于做 C 盘只读体检、扫描低风险缓存、查看桌面/下载目录大文件、重复文件、常见应用占用，并在确认后生成清理或归档计划。适合先找证据，再少量、安全地释放空间。",
+    steps: ["先点“开始体检”看总体风险。", "桌面急救和下载目录先用“只读分析”，分页查看分类占用和 Top 文件。", "只把确认不需要的项目加入计划，再预览清理或归档。"],
+    readonly: ["体检、扫描、文件定位、复制路径、重复候选分析和应用占用统计都是只读。", "桌面/下载明细只展示文件名、路径、目录、大小、修改时间、类型和定位状态。"],
+    writes: ["清理会重新校验选中项，普通文件进入回收站或调用官方缓存命令。", "归档/搬家会先生成计划，展示源、目标、估算大小、风险和回滚信息。"],
+    safety: ["不会自动删除未选择文件，不会读取数据库正文或浏览器凭据。", "执行清理、搬家、回滚和扩容计划都需要 token；失败后先重新扫描。"],
+  },
+  toolbox: {
+    title: "工具箱",
+    intro: "工具箱承载命令面板、更新、本地服务、Docker/WSL 和卸载等高级入口。它适合有明确目标时使用，不建议把这里当作一键系统管家。",
+    steps: ["先展开对应高级区并阅读说明。", "服务和 Docker/WSL 操作前确认目标名称、端口和当前状态。", "更新前先检查版本，再下载并校验安装包。"],
+    readonly: ["服务检查、日志读取、Docker/WSL 状态检查、更新检查是只读。", "打开系统位置或复制日志不会修改状态。"],
+    writes: ["启动/停止服务、Docker/WSL 安装更新、下载更新、自卸载会改变系统状态或打开系统工具。", "自卸载只打开 Windows 卸载器并关闭程序，不主动删除项目、数据库或运行时目录。"],
+    safety: ["系统级动作折叠在高级区，并要求 token 或明确确认。", "失败后不要连续重复点击，先复制日志或错误信息。"],
+  },
+};
+
+function riskInfoForView(view: string) {
+  const featureId = VIEW_FEATURE_MAP[view] || "overview";
+  return state.featureRisks.find((item) => item.featureId === featureId);
+}
+
+function renderViewGuide(view = currentView()) {
+  const guide = document.querySelector<HTMLElement>("#view-guide-text");
+  if (!guide) return;
+  const definition = VIEW_GUIDES[view] || VIEW_GUIDES.overview;
+  const info = riskInfoForView(view);
+  const riskHtml = info
+    ? `<section><h4>风险与边界</h4><ul>
+        <li>风险等级：${escapeHtml(info.riskLevel)}；确认级别：${escapeHtml(info.confirmationLevel === "none" ? "无需确认" : info.confirmationLevel === "triple" ? "三次确认" : "二次确认")}。</li>
+        <li>${info.requiresBackup ? "执行前需要备份或生成可恢复记录。" : "主要是只读或低风险动作，通常不需要备份。"}</li>
+        ${info.whatItDoes.map((item) => `<li>能做：${escapeHtml(item)}</li>`).join("")}
+        ${info.whatItDoesNotDo.map((item) => `<li>不会做：${escapeHtml(item)}</li>`).join("")}
+      </ul></section>`
+    : "";
+  guide.innerHTML = `
+    <section><h3>${escapeHtml(definition.title)}</h3><p>${escapeHtml(definition.intro)}</p></section>
+    <section><h4>建议流程</h4><ol>${definition.steps.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol></section>
+    <section><h4>只读能力</h4><ul>${definition.readonly.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></section>
+    <section><h4>会修改什么</h4><ul>${definition.writes.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></section>
+    <section><h4>安全与失败处理</h4><ul>${definition.safety.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></section>
+    ${riskHtml}
+  `;
+}
+
+function renderFeatureHelp(_view = currentView()) {
   const slot = document.querySelector<HTMLElement>("#feature-help-slot");
   if (!slot) return;
-  const featureId = VIEW_FEATURE_MAP[view] || "overview";
-  const info = state.featureRisks.find((item) => item.featureId === featureId);
-  if (!info) {
-    slot.innerHTML = "";
-    return;
-  }
-  const card = featureHelpCard(
-    escapeHtml(info.title),
-    escapeHtml(info.riskLevel),
-    [
-      ...info.whatItDoes,
-      `确认级别：${info.confirmationLevel === "none" ? "无需确认" : info.confirmationLevel === "triple" ? "三次确认" : "二次确认"}`,
-      info.requiresBackup ? "执行前需要备份或生成可恢复记录。" : "只读或低风险操作通常不需要备份。",
-    ].map(escapeHtml),
-    [
-      ...info.whatItDoesNotDo,
-      info.requiresAdmin ? "需要管理员权限时会明确提示。" : "不会静默请求管理员权限。",
-    ].map(escapeHtml),
-  );
-  const collapsed = featureHelpCollapsed(view);
-  slot.innerHTML = collapsed
-    ? `<button class="feature-help-strip" data-action="feature-help-expand" data-help-view="${escapeHtml(view)}">${icon(FileText)}<span>${escapeHtml(info.title)}</span><small>点击展开说明</small></button>`
-    : `<section class="feature-help-shell" data-help-view="${escapeHtml(view)}">
-        <div class="feature-help-controls">
-          <label class="toggle-row"><input type="checkbox" data-action="feature-help-collapse-next" data-help-view="${escapeHtml(view)}" ${collapsed ? "checked" : ""} /><span>下次进入此页面默认折叠</span></label>
-        </div>
-        ${card}
-      </section>`;
-}
-
-function featureHelpCollapsed(view: string) {
-  try {
-    return window.localStorage.getItem(`devenv.featureHelp.collapsed.${view}`) === "true";
-  } catch {
-    return false;
-  }
-}
-
-function setFeatureHelpCollapsed(view: string, collapsed: boolean) {
-  try {
-    window.localStorage.setItem(`devenv.featureHelp.collapsed.${view}`, collapsed ? "true" : "false");
-  } catch {
-    // localStorage can be unavailable in recovery contexts; default-expanded remains safe.
-  }
+  slot.innerHTML = "";
 }
 
 function escapeHtml(value: string) {
@@ -4323,8 +4422,8 @@ document.addEventListener("click", async (event) => {
     else if (pageKey === "project-ports") renderProjectPortConfigs();
     else if (pageKey.startsWith("project-") && state.project) renderProjectAnalysis(state.project);
     else if (pageKey === "environment-backups") renderEnvironmentBackups();
-    else if (pageKey === "desktop-usage") renderFolderUsage("#desktop-usage", state.desktopUsage, "desktop-usage");
-    else if (pageKey === "downloads-usage") renderFolderUsage("#downloads-usage", state.downloadsUsage, "downloads-usage");
+    else if (pageKey.startsWith("desktop-usage")) renderFolderUsage("#desktop-usage", state.desktopUsage, "desktop-usage");
+    else if (pageKey.startsWith("downloads-usage")) renderFolderUsage("#downloads-usage", state.downloadsUsage, "downloads-usage");
     else if (pageKey === "large-files") renderLargeFiles();
     else if (pageKey === "archive-plan") renderArchivePlan();
     else if (pageKey === "rollback-records") renderRollbackRecords();
@@ -4622,12 +4721,6 @@ document.addEventListener("click", async (event) => {
     if (input) input.value = jdkPath;
     activateView("environment");
     document.querySelector<HTMLButtonElement>("#create-java-stabilize-plan")?.click();
-    return;
-  }
-  if (action === "feature-help-expand") {
-    const view = button.dataset.helpView || document.querySelector(".nav-item.active")?.getAttribute("data-view") || "overview";
-    setFeatureHelpCollapsed(view, false);
-    renderFeatureHelp(view);
     return;
   }
   if (action === "doctor-fix") {
@@ -4944,13 +5037,6 @@ window.addEventListener("error", (event) => {
 
 window.addEventListener("unhandledrejection", (event) => {
   enterSafeMode(event.reason, "未处理的异步错误");
-});
-
-document.addEventListener("change", (event) => {
-  const input = (event.target as HTMLElement).closest<HTMLInputElement>('input[data-action="feature-help-collapse-next"]');
-  if (!input) return;
-  const view = input.dataset.helpView || document.querySelector(".nav-item.active")?.getAttribute("data-view") || "overview";
-  setFeatureHelpCollapsed(view, input.checked);
 });
 
 window.addEventListener(

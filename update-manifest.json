@@ -1,9 +1,9 @@
 {
-  "version": "1.5.3",
+  "version": "1.6.0",
   "date": "2026-06-28",
   "notes": [
-    "1.5.3 Stable：基于真实用户反馈的质量收口版本，补全端口管理、外部运行时安全、MySQL 诊断闭环、Python/chsrc 可恢复路径、页面帮助、扫描体验和隐私脱敏。"
+    "1.6 Stable：补齐高风险后端确认闭环，优化页面使用指南、桌面/下载分页明细、端口与服务安全保护、MySQL 修复执行保护和右下角提示生命周期。"
   ],
-  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.5.3/DevEnv.Manager_1.5.3_x64-setup.exe",
-  "sha256": "32439838bc46687010b83d4c5f80583fbb0c2b99ed4a836078772184f50e069c"
+  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.6/DevEnv.Manager_1.6_x64-setup.exe",
+  "sha256": "0224a9a6cc3b2004296d2b7c01d6c252a628e9f8fad3254e3dcb9d5bbd2df013"
 }
