@@ -1,9 +1,9 @@
 {
-  "version": "1.6.0",
-  "date": "2026-06-28",
+  "version": "1.6.1",
+  "date": "2026-06-30",
   "notes": [
-    "1.6 Stable：补齐高风险后端确认闭环，优化页面使用指南、桌面/下载分页明细、端口与服务安全保护、MySQL 修复执行保护和右下角提示生命周期。"
+    "1.6.1 Stable：实机验收后的收口版，继续完善页面帮助模块拆分、v1.6 QA Gate 收尾和 issue 关闭状态；保留 1.6 的高风险确认、桌面/下载分页明细和发布链路。"
   ],
-  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.6/DevEnv.Manager_1.6_x64-setup.exe",
-  "sha256": "0224a9a6cc3b2004296d2b7c01d6c252a628e9f8fad3254e3dcb9d5bbd2df013"
+  "downloadUrl": "https://github.com/weidonglang/DevEnv-Manager/releases/download/v1.6.1/DevEnv.Manager_1.6.1_x64-setup.exe",
+  "sha256": "4980e5c33e3ab0a070fe50f35af8d20f7826b4757c30b232fb26fe26b10e8dce"
 }
